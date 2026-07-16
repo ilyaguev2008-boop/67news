@@ -6,7 +6,10 @@ load_dotenv()
 # --- Обязательные переменные (задаются в .env, см. .env.example) ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")            # токен бота от @BotFather
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))    # твой Telegram user_id — куда слать черновики
-CHANNEL_ID = os.getenv("CHANNEL_ID")          # @username канала или -100xxxxxxxxxx
+
+# CHANNEL_ID больше не используется напрямую — каналы для публикации теперь
+# добавляются и удаляются прямо в боте через кнопку "📋 Мои каналы"
+# (хранятся в базе данных). Переменную можно оставить пустой.
 
 # Необязательно: ключ Unsplash для поиска фото, если на странице новости
 # не нашлось подходящей картинки (og:image). Если не задан — используется
@@ -18,32 +21,37 @@ UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
 # чтобы отключить перевод и получать новости в оригинале.
 TRANSLATE_TO = "ru"
 
-# --- Список источников новостей (RSS-ленты фан-сайтов клубов) ---
+# --- Список источников новостей (RSS-ленты по клубам) ---
 # Формат: ("Название источника", "URL RSS-ленты")
-# Это независимые (не официальные) фан-сайты/блоги — часть сети SB Nation
-# и другие крупные англоязычные фан-ресурсы. Ссылки собраны из открытых
-# каталогов RSS-лент; если какая-то лента перестанет работать (сайты
-# иногда меняют структуру), fetcher.py просто пропустит её с предупреждением
-# в консоли, не уронив весь бот — замени нерабочую ссылку на альтернативу.
+# Используются официальные RSS-ленты BBC Sport по конкретным командам —
+# проверил их лично, отдают свежие новости на сегодняшний день.
+# Это надёжнее фан-блогов, у которых RSS часто отваливается/меняется.
+# Если какая-то лента всё же перестанет работать, fetcher.py просто
+# пропустит её с предупреждением в консоли, не уронив весь бот.
 FEEDS = [
-    ("Real Madrid — Managing Madrid", "https://www.managingmadrid.com/rss/current.xml"),
-    ("Manchester United — The Busby Babe", "https://www.thebusbybabe.com/rss/current.xml"),
-    ("Manchester City — Man City News", "https://www.mancitynews.com/feed"),
-    ("PSG — PSG Talk", "https://psgtalk.com/feed"),
-    ("Barcelona — Barca Universal", "https://barcauniversal.com/feed"),
-    ("Atletico Madrid — Into The Calderon", "https://www.intothecalderon.com/rss/current.xml"),
-    ("Chelsea — Talk Chelsea", "https://talkchelsea.net/feed"),
-    ("Arsenal — Arseblog", "https://arseblog.com/feed"),
-    ("Bayern Munich — Miasanrot", "https://miasanrot.com/feed"),
-    ("Inter & Milan — Football Italia", "https://football-italia.net/feed"),
+    ("Real Madrid — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/real-madrid/rss.xml"),
+    ("Manchester United — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/manchester-united/rss.xml"),
+    ("Manchester City — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/manchester-city/rss.xml"),
+    ("PSG — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/paris-saint-germain/rss.xml"),
+    ("Barcelona — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/barcelona/rss.xml"),
+    ("Atletico Madrid — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/atletico-madrid/rss.xml"),
+    ("Chelsea — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/chelsea/rss.xml"),
+    ("Arsenal — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/arsenal/rss.xml"),
+    ("Bayern Munich — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/bayern-munich/rss.xml"),
+    ("Inter Milan — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/inter-milan/rss.xml"),
+    ("AC Milan — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/ac-milan/rss.xml"),
 ]
 
 # Как часто проверять ленты на новые новости (в минутах)
 POLL_INTERVAL_MINUTES = 10
 
-# Сколько последних записей из каждой ленты рассматривать за один проход
-# (защита от обвала стартового большого списка при первом запуске)
-MAX_ENTRIES_PER_FEED = 5
+# За сколько последних часов брать новости из ленты (независимо от того,
+# когда бот запускался в прошлый раз). 24 — последние сутки.
+LOOKBACK_HOURS = 24
+
+# Верхняя граница на число записей с одной ленты за один проход
+# (защита от обвала, если лента вдруг отдаст сотни записей разом)
+MAX_ENTRIES_PER_FEED = 20
 
 # Путь к файлу базы данных (SQLite) — хранит "уже обработанные" новости и черновики
 DB_PATH = "bot_storage.db"

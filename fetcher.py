@@ -1,12 +1,14 @@
 import re
+import time
 import logging
+from datetime import datetime, timezone, timedelta
 
 import feedparser
 import requests
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
 
-from config import UNSPLASH_ACCESS_KEY, MAX_ENTRIES_PER_FEED, TRANSLATE_TO
+from config import UNSPLASH_ACCESS_KEY, MAX_ENTRIES_PER_FEED, TRANSLATE_TO, LOOKBACK_HOURS
 
 logger = logging.getLogger(__name__)
 
@@ -25,13 +27,41 @@ def clean_html(raw_html: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _entry_published_dt(entry):
+    """Возвращает datetime публикации записи (UTC), если он есть в RSS."""
+    struct_time = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not struct_time:
+        return None
+    return datetime.fromtimestamp(time.mktime(struct_time), tz=timezone.utc)
+
+
 def fetch_feed_entries(feed_url: str):
-    """Возвращает список последних записей RSS-ленты."""
+    """
+    Возвращает записи RSS-ленты за последние LOOKBACK_HOURS часов
+    (config.py). Записи без даты публикации в RSS не отбрасываются —
+    попадают в выдачу как есть, чтобы не терять новости из-за
+    нестандартного формата ленты. Ограничено MAX_ENTRIES_PER_FEED на
+    случай, если лента отдаёт слишком много записей разом.
+    """
     parsed = feedparser.parse(feed_url)
     if parsed.bozo and not parsed.entries:
         logger.warning(f"Не удалось разобрать ленту {feed_url}: {parsed.bozo_exception}")
         return []
-    return parsed.entries[:MAX_ENTRIES_PER_FEED]
+
+    all_entries = parsed.entries
+    logger.info(f"{feed_url}: в ленте всего {len(all_entries)} записей")
+
+    if LOOKBACK_HOURS:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+        recent = []
+        for entry in all_entries:
+            pub_dt = _entry_published_dt(entry)
+            if pub_dt is None or pub_dt >= cutoff:
+                recent.append(entry)
+        logger.info(f"{feed_url}: из них за последние {LOOKBACK_HOURS} ч. — {len(recent)}")
+        all_entries = recent
+
+    return all_entries[:MAX_ENTRIES_PER_FEED]
 
 
 def entry_unique_id(entry) -> str:
