@@ -42,8 +42,21 @@ def fetch_feed_entries(feed_url: str):
     попадают в выдачу как есть, чтобы не терять новости из-за
     нестандартного формата ленты. Ограничено MAX_ENTRIES_PER_FEED на
     случай, если лента отдаёт слишком много записей разом.
+
+    Лента скачивается через requests (а не напрямую через
+    feedparser.parse(url)) — у requests свой пакет сертификатов (certifi),
+    который не зависит от системных настроек Python. Это защищает от
+    ошибки SSL: CERTIFICATE_VERIFY_FAILED, характерной для Python на
+    macOS, поставленного через python.org-инсталлятор.
     """
-    parsed = feedparser.parse(feed_url)
+    try:
+        response = requests.get(feed_url, headers=HEADERS, timeout=15)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        logger.warning(f"Не удалось скачать ленту {feed_url}: {e}")
+        return []
+
+    parsed = feedparser.parse(response.content)
     if parsed.bozo and not parsed.entries:
         logger.warning(f"Не удалось разобрать ленту {feed_url}: {parsed.bozo_exception}")
         return []
