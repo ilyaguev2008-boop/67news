@@ -85,6 +85,16 @@ def create_draft(feed_name: str, source_link: str, title: str, text: str, image_
     return draft_id
 
 
+def get_pending_draft_ids():
+    """Все черновики со статусом pending, старые сначала — то, что накопил
+    фоновый планировщик между твоими проверками, плюс всё найденное только что."""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.execute(
+            "SELECT draft_id FROM drafts WHERE status = 'pending' ORDER BY created_at"
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
 def get_draft(draft_id: str):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         cur = conn.execute(

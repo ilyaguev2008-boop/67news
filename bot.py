@@ -204,14 +204,18 @@ async def check_feed(message: Message):
         return
 
     await message.answer("Проверяю ленты…")
-    new_ids = await poll_feeds()
+    await poll_feeds()  # подтягивает самое свежее прямо сейчас
 
-    if not new_ids:
+    # Берём ВСЕ ещё не просмотренные черновики — включая те, что фоновый
+    # планировщик уже успел накопить между твоими проверками
+    pending_ids = storage.get_pending_draft_ids()
+
+    if not pending_ids:
         await message.answer("Новых новостей нет.", reply_markup=main_menu_kb)
         return
 
-    review_queues[message.from_user.id] = new_ids
-    await message.answer(f"Нашёл новых новостей: {len(new_ids)}. Показываю по одной:")
+    review_queues[message.from_user.id] = pending_ids
+    await message.answer(f"Новостей на проверку: {len(pending_ids)}. Показываю по одной:")
     await send_next_in_queue(message.from_user.id)
 
 
