@@ -54,16 +54,23 @@ class AddChannel(StatesGroup):
 
 # ---------- Клавиатуры ----------
 
-def moderation_keyboard(draft_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{draft_id}"),
-                InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit:{draft_id}"),
-                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{draft_id}"),
-            ]
+def moderation_keyboard(draft_id: str, source_link: str = None) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{draft_id}"),
+            InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit:{draft_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{draft_id}"),
         ]
-    )
+    ]
+    if source_link:
+        rows.append([InlineKeyboardButton(text="🔗 Источник", url=source_link)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def source_only_keyboard(source_link: str) -> InlineKeyboardMarkup | None:
+    if not source_link:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔗 Источник", url=source_link)]])
 
 
 def channel_choice_keyboard(draft_id: str) -> InlineKeyboardMarkup:
@@ -90,8 +97,6 @@ def channels_menu_keyboard() -> InlineKeyboardMarkup:
 
 async def send_draft_to_admin(draft: dict):
     caption = draft["text"]
-    if draft["source_link"]:
-        caption += f"\n\n🔗 Источник: {draft['source_link']}"
     if len(caption) > 1024:
         caption = caption[:1000].rsplit(" ", 1)[0] + "…"
 
@@ -99,7 +104,7 @@ async def send_draft_to_admin(draft: dict):
         chat_id=config.ADMIN_ID,
         photo=draft["image_url"],
         caption=caption,
-        reply_markup=moderation_keyboard(draft["draft_id"]),
+        reply_markup=moderation_keyboard(draft["draft_id"], draft.get("source_link")),
     )
 
 
@@ -138,7 +143,7 @@ async def poll_feeds() -> list[str]:
 
             article_url = entry.get("link", "")
             title = entry.get("title", "Без названия")
-            text = build_draft_text(entry)
+            text = build_draft_text(entry, article_url)
             image_url = get_image_for_entry(entry, article_url, title)
 
             draft_id = storage.create_draft(
@@ -301,11 +306,16 @@ async def publish_draft(callback: CallbackQuery, draft_id: str, channel_id: str)
         caption = caption[:1000].rsplit(" ", 1)[0] + "…"
 
     try:
-        await bot.send_photo(chat_id=channel_id, photo=draft["image_url"], caption=caption)
+        await bot.send_photo(
+            chat_id=channel_id,
+            photo=draft["image_url"],
+            caption=caption,
+            reply_markup=source_only_keyboard(draft.get("source_link")),
+        )
         storage.update_draft_status(draft_id, "approved", published_channel_id=channel_id)
         await callback.message.edit_caption(
             caption=draft["text"] + f"\n\n✅ ОПУБЛИКОВАНО",
-            reply_markup=None,
+            reply_markup=source_only_keyboard(draft.get("source_link")),
         )
     except Exception as e:
         logger.error(f"Ошибка публикации в канал {channel_id}: {e}")
@@ -323,7 +333,10 @@ async def handle_cancel_publish(callback: CallbackQuery):
     if not draft:
         await callback.answer("Черновик не найден.", show_alert=True)
         return
-    await callback.message.edit_caption(caption=draft["text"], reply_markup=moderation_keyboard(draft_id))
+    await callback.message.edit_caption(
+        caption=draft["text"],
+        reply_markup=moderation_keyboard(draft_id, draft.get("source_link")),
+    )
     await callback.answer()
 
 

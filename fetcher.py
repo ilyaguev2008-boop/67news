@@ -146,16 +146,47 @@ def search_fallback_image(query: str) -> str:
 
 
 def get_image_for_entry(entry, article_url: str, title: str) -> str:
-    """Порядок: картинка из RSS -> og:image статьи -> поиск по теме -> плейсхолдер."""
-    image = extract_image_from_rss_entry(entry)
-    if image:
-        return image
-
+    """
+    Порядок: og:image самой статьи (обычно полноразмерное фото,
+    1000+ px в ширину) -> картинка из RSS-записи (часто маленькая
+    миниатюра, например 130x76 у BBC) -> поиск по теме -> плейсхолдер.
+    """
     image = extract_image_from_article(article_url)
     if image:
         return image
 
+    image = extract_image_from_rss_entry(entry)
+    if image:
+        return image
+
     return search_fallback_image(title)
+
+
+def extract_article_text(article_url: str, max_chars: int = 1200) -> str:
+    """
+    Заходит на страницу статьи и собирает основной текст (абзацы <p>).
+    Отсекает короткие служебные строки (меню, подписи под фото и т.п.),
+    оставляя только содержательные абзацы. Обрезает по max_chars.
+    """
+    try:
+        resp = requests.get(article_url, headers=HEADERS, timeout=10)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        logger.warning(f"Не удалось загрузить текст статьи {article_url}: {e}")
+        return ""
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    container = soup.find("article") or soup
+
+    paragraphs = [p.get_text(" ", strip=True) for p in container.find_all("p")]
+    # оставляем только содержательные абзацы — короткие строки обычно навигация/подписи
+    meaningful = [p for p in paragraphs if len(p) > 40]
+    text = " ".join(meaningful)
+
+    if len(text) > max_chars:
+        text = text[:max_chars].rsplit(" ", 1)[0] + "…"
+
+    return text
 
 
 def translate_text(text: str) -> str:
@@ -177,11 +208,20 @@ def translate_text(text: str) -> str:
         return text
 
 
-def build_draft_text(entry) -> str:
+def build_draft_text(entry, article_url: str = "") -> str:
+    """
+    Собирает текст поста. Приоритет — полный текст статьи (даёт гораздо
+    больше содержания, чем короткий RSS-summary); если его не удалось
+    достать — используется summary из самой RSS-записи как запасной
+    вариант.
+    """
     title = entry.get("title", "").strip()
-    summary = clean_html(entry.get("summary", ""))
+    rss_summary = clean_html(entry.get("summary", ""))
+
+    full_text = extract_article_text(article_url) if article_url else ""
+    body = full_text if len(full_text) > len(rss_summary) else rss_summary
 
     title = translate_text(title)
-    summary = translate_text(summary)
+    body = translate_text(body)
 
-    return f"⚽ {title}\n\n{summary}"
+    return f"⚽ {title}\n\n{body}"
