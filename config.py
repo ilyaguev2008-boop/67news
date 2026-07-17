@@ -21,23 +21,40 @@ UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
 # чтобы отключить перевод и получать новости в оригинале.
 TRANSLATE_TO = "ru"
 
-# --- Список источников новостей (RSS-ленты по клубам) ---
+# --- Список источников новостей ---
 # Формат: ("Название источника", "URL RSS-ленты")
-# Используются официальные RSS-ленты BBC Sport по конкретным командам —
-# проверил их лично, отдают свежие новости на сегодняшний день.
-# Это надёжнее фан-блогов, у которых RSS часто отваливается/меняется.
-# Если какая-то лента всё же перестанет работать, fetcher.py просто
-# пропустит её с предупреждением в консоли, не уронив весь бот.
+# Используются официальные RSS-ленты BBC Sport (по конкретным командам +
+# общая футбольная лента) и Sky Sports — проверил их лично, отдают
+# свежие новости на сегодняшний день. Это надёжнее фан-блогов, у которых
+# RSS часто отваливается/меняется. Если какая-то лента всё же перестанет
+# работать, fetcher.py просто пропустит её с предупреждением в консоли,
+# не уронив весь бот.
 FEEDS = [
+    # Общие ленты — трансферы, сборные, турниры, аналитика, не привязаны
+    # к одному клубу
+    ("Футбол в целом — BBC Sport", "https://feeds.bbci.co.uk/sport/football/rss.xml"),
+    ("Футбол в целом — Sky Sports", "https://www.skysports.com/rss/12040"),
+    ("Футбол в целом — The Guardian", "https://www.theguardian.com/football/rss"),
+
+    # Ленты по отдельным клубам
     ("Real Madrid — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/real-madrid/rss.xml"),
     ("Manchester United — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/manchester-united/rss.xml"),
     ("Manchester City — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/manchester-city/rss.xml"),
+    ("Liverpool — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/liverpool/rss.xml"),
+    ("Tottenham Hotspur — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/tottenham-hotspur/rss.xml"),
+    ("Newcastle United — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/newcastle-united/rss.xml"),
+    ("Aston Villa — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/aston-villa/rss.xml"),
+    ("West Ham United — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/west-ham-united/rss.xml"),
+    ("Everton — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/everton/rss.xml"),
+    ("Brighton — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/brighton-and-hove-albion/rss.xml"),
     ("PSG — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/paris-saint-germain/rss.xml"),
     ("Barcelona — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/barcelona/rss.xml"),
     ("Atletico Madrid — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/atletico-madrid/rss.xml"),
     ("Chelsea — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/chelsea/rss.xml"),
     ("Arsenal — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/arsenal/rss.xml"),
     ("Bayern Munich — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/bayern-munich/rss.xml"),
+    ("Juventus — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/juventus/rss.xml"),
+    ("Napoli — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/napoli/rss.xml"),
     ("Inter Milan — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/inter-milan/rss.xml"),
     ("AC Milan — BBC Sport", "https://feeds.bbci.co.uk/sport/football/teams/ac-milan/rss.xml"),
 ]
