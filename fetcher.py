@@ -8,7 +8,7 @@ import requests
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
 
-from config import UNSPLASH_ACCESS_KEY, MAX_ENTRIES_PER_FEED, TRANSLATE_TO, LOOKBACK_HOURS, ARTICLE_MAX_CHARS
+from config import UNSPLASH_ACCESS_KEY, MAX_ENTRIES_PER_FEED, TRANSLATE_TO, LOOKBACK_HOURS, ARTICLE_MAX_CHARS, USE_SOURCE_IMAGES
 
 logger = logging.getLogger(__name__)
 
@@ -122,39 +122,86 @@ def extract_image_from_article(article_url: str) -> str | None:
     return None
 
 
-def search_fallback_image(query: str) -> str:
-    """Если у статьи вообще нет картинки — ищем через Unsplash (если задан ключ) либо возвращаем плейсхолдер."""
-    if not UNSPLASH_ACCESS_KEY:
-        return PLACEHOLDER_IMAGE
+def search_wikimedia_image(query: str) -> str | None:
+    """
+    Бесплатный поиск фото без API-ключа — через Wikimedia Commons.
+    Качество/релевантность ниже, чем у Unsplash, но не требует настройки
+    и не привязан к лимитам стороннего платного API.
+    """
     try:
         resp = requests.get(
-            "https://api.unsplash.com/search/photos",
-            params={"query": query, "per_page": 1, "orientation": "landscape"},
-            headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"},
+            "https://commons.wikimedia.org/w/api.php",
+            params={
+                "action": "query",
+                "generator": "search",
+                "gsrsearch": f"{query} football",
+                "gsrnamespace": 6,  # namespace 6 = файлы
+                "gsrlimit": 1,
+                "prop": "imageinfo",
+                "iiprop": "url",
+                "iiurlwidth": 1200,
+                "format": "json",
+            },
+            headers=HEADERS,
             timeout=10,
         )
         resp.raise_for_status()
-        results = resp.json().get("results", [])
-        if results:
-            return results[0]["urls"]["regular"]
+        pages = resp.json().get("query", {}).get("pages", {})
+        for page in pages.values():
+            imageinfo = page.get("imageinfo")
+            if imageinfo:
+                url = imageinfo[0].get("thumburl") or imageinfo[0].get("url")
+                if url and url.lower().endswith((".jpg", ".jpeg", ".png")):
+                    return url
     except requests.RequestException as e:
-        logger.warning(f"Unsplash fallback не сработал: {e}")
+        logger.warning(f"Wikimedia-поиск не сработал: {e}")
+    return None
+
+
+def search_fallback_image(query: str) -> str:
+    """
+    Ищет фото по теме в интернете — сначала Wikimedia Commons (бесплатно,
+    без ключа), затем Unsplash (если задан UNSPLASH_ACCESS_KEY), и только
+    если оба варианта не дали результата — общий плейсхолдер.
+    """
+    image = search_wikimedia_image(query)
+    if image:
+        return image
+
+    if UNSPLASH_ACCESS_KEY:
+        try:
+            resp = requests.get(
+                "https://api.unsplash.com/search/photos",
+                params={"query": query, "per_page": 1, "orientation": "landscape"},
+                headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            results = resp.json().get("results", [])
+            if results:
+                return results[0]["urls"]["regular"]
+        except requests.RequestException as e:
+            logger.warning(f"Unsplash fallback не сработал: {e}")
+
     return PLACEHOLDER_IMAGE
 
 
 def get_image_for_entry(entry, article_url: str, title: str) -> str:
     """
-    Порядок: og:image самой статьи (обычно полноразмерное фото,
-    1000+ px в ширину) -> картинка из RSS-записи (часто маленькая
-    миниатюра, например 130x76 у BBC) -> поиск по теме -> плейсхолдер.
+    По умолчанию НЕ берёт фото со страницы источника (og:image) и не
+    берёт миниатюру из RSS — у крупных изданий (BBC, Sky и т.п.) эти
+    фото почти всегда содержат их логотип/вотермарку. Вместо этого сразу
+    ищет нейтральное фото по теме в интернете (Wikimedia Commons /
+    Unsplash). Если понадобится вернуть старое поведение — см.
+    config.USE_SOURCE_IMAGES.
     """
-    image = extract_image_from_article(article_url)
-    if image:
-        return image
-
-    image = extract_image_from_rss_entry(entry)
-    if image:
-        return image
+    if USE_SOURCE_IMAGES:
+        image = extract_image_from_article(article_url)
+        if image:
+            return image
+        image = extract_image_from_rss_entry(entry)
+        if image:
+            return image
 
     return search_fallback_image(title)
 
