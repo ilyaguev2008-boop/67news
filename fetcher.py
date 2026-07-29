@@ -8,7 +8,7 @@ import requests
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
 
-from config import UNSPLASH_ACCESS_KEY, MAX_ENTRIES_PER_FEED, TRANSLATE_TO, LOOKBACK_HOURS
+from config import UNSPLASH_ACCESS_KEY, MAX_ENTRIES_PER_FEED, TRANSLATE_TO, LOOKBACK_HOURS, ARTICLE_MAX_CHARS
 
 logger = logging.getLogger(__name__)
 
@@ -39,15 +39,13 @@ def fetch_feed_entries(feed_url: str):
     """
     Возвращает записи RSS-ленты за последние LOOKBACK_HOURS часов
     (config.py). Записи без даты публикации в RSS не отбрасываются —
-    попадают в выдачу как есть, чтобы не терять новости из-за
-    нестандартного формата ленты. Ограничено MAX_ENTRIES_PER_FEED на
-    случай, если лента отдаёт слишком много записей разом.
+    попадают в выдачу как есть. Ограничено MAX_ENTRIES_PER_FEED.
 
     Лента скачивается через requests (а не напрямую через
     feedparser.parse(url)) — у requests свой пакет сертификатов (certifi),
-    который не зависит от системных настроек Python. Это защищает от
-    ошибки SSL: CERTIFICATE_VERIFY_FAILED, характерной для Python на
-    macOS, поставленного через python.org-инсталлятор.
+    независимый от системных настроек Python. Это обходит ошибку
+    SSL: CERTIFICATE_VERIFY_FAILED, характерную для Python на macOS,
+    поставленного через python.org-инсталлятор.
     """
     try:
         response = requests.get(feed_url, headers=HEADERS, timeout=15)
@@ -116,7 +114,6 @@ def extract_image_from_article(article_url: str) -> str | None:
     if twitter_image and twitter_image.get("content"):
         return twitter_image["content"]
 
-    # fallback: первая достаточно большая картинка в теле статьи
     for img in soup.find_all("img"):
         src = img.get("src") or img.get("data-src")
         if src and src.startswith("http"):
@@ -162,12 +159,16 @@ def get_image_for_entry(entry, article_url: str, title: str) -> str:
     return search_fallback_image(title)
 
 
-def extract_article_text(article_url: str, max_chars: int = 1200) -> str:
+def extract_article_text(article_url: str, max_chars: int = None) -> str:
     """
     Заходит на страницу статьи и собирает основной текст (абзацы <p>).
     Отсекает короткие служебные строки (меню, подписи под фото и т.п.),
-    оставляя только содержательные абзацы. Обрезает по max_chars.
+    оставляя только содержательные абзацы. Обрезает по max_chars
+    (по умолчанию — config.ARTICLE_MAX_CHARS).
     """
+    if max_chars is None:
+        max_chars = ARTICLE_MAX_CHARS
+
     try:
         resp = requests.get(article_url, headers=HEADERS, timeout=10)
         resp.raise_for_status()
@@ -225,3 +226,15 @@ def build_draft_text(entry, article_url: str = "") -> str:
     body = translate_text(body)
 
     return f"⚽ {title}\n\n{body}"
+
+
+def build_entry_content(entry, article_url: str, title: str):
+    """
+    Объединяет весь тяжёлый блокирующий сетевой труд по одной новости
+    (текст статьи + перевод + поиск фото) в один вызов — чтобы вызывающий
+    код мог отдать его целиком в отдельный поток через asyncio.to_thread
+    и не блокировать event loop бота на время сетевых запросов.
+    """
+    text = build_draft_text(entry, article_url)
+    image_url = get_image_for_entry(entry, article_url, title)
+    return text, image_url

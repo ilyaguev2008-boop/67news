@@ -13,6 +13,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    FSInputFile,
 )
 from aiogram.exceptions import TelegramBadRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -22,9 +23,10 @@ import storage
 from fetcher import (
     fetch_feed_entries,
     entry_unique_id,
-    get_image_for_entry,
-    build_draft_text,
+    build_entry_content,
 )
+from instagram_source import poll_instagram
+from tg_channels_source import start_telegram_monitor, is_configured as tg_channels_configured
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -95,14 +97,42 @@ def channels_menu_keyboard() -> InlineKeyboardMarkup:
 
 # ---------- Отправка черновика ----------
 
+CAPTION_LIMIT = 1024  # жёсткий лимит Telegram на подпись к фото
+
+
+def truncate_caption(text: str, suffix: str = "") -> str:
+    """
+    Обрезает текст под лимит подписи Telegram (1024 символа), оставляя
+    место под суффикс (например, '\\n\\n✅ ОПУБЛИКОВАНО'). Используется
+    везде, где caption собирается из draft['text'] — с тех пор как текст
+    стал полным пересказом статьи, а не коротким RSS-summary, он почти
+    всегда длиннее лимита.
+    """
+    budget = CAPTION_LIMIT - len(suffix)
+    if len(text) <= budget:
+        return text + suffix
+    trimmed = text[: budget - 1].rsplit(" ", 1)[0] + "…"
+    return trimmed + suffix
+
+
+def photo_input(image_url: str):
+    """
+    RSS-источники дают ссылку (http/https) — Telegram сам её скачает.
+    Telegram-каналы и Instagram дают путь к уже скачанному локальному
+    файлу — в этом случае нужно обернуть в FSInputFile, иначе aiogram
+    попытается воспринять путь как ссылку и упадёт.
+    """
+    if image_url.startswith("http://") or image_url.startswith("https://"):
+        return image_url
+    return FSInputFile(image_url)
+
+
 async def send_draft_to_admin(draft: dict):
-    caption = draft["text"]
-    if len(caption) > 1024:
-        caption = caption[:1000].rsplit(" ", 1)[0] + "…"
+    caption = truncate_caption(draft["text"])
 
     await bot.send_photo(
         chat_id=config.ADMIN_ID,
-        photo=draft["image_url"],
+        photo=photo_input(draft["image_url"]),
         caption=caption,
         reply_markup=moderation_keyboard(draft["draft_id"], draft.get("source_link")),
     )
@@ -131,7 +161,9 @@ async def poll_feeds() -> list[str]:
     new_draft_ids = []
 
     for feed_name, feed_url in config.FEEDS:
-        entries = fetch_feed_entries(feed_url)
+        # Скачивание и разбор RSS — блокирующая сетевая операция,
+        # уводим в отдельный поток, чтобы не морозить event loop бота
+        entries = await asyncio.to_thread(fetch_feed_entries, feed_url)
         already_seen_count = 0
         new_from_this_feed = 0
 
@@ -143,8 +175,12 @@ async def poll_feeds() -> list[str]:
 
             article_url = entry.get("link", "")
             title = entry.get("title", "Без названия")
-            text = build_draft_text(entry, article_url)
-            image_url = get_image_for_entry(entry, article_url, title)
+
+            # Текст статьи + перевод + поиск фото — тоже блокирующие
+            # сетевые запросы, тоже в отдельный поток
+            text, image_url = await asyncio.to_thread(
+                build_entry_content, entry, article_url, title
+            )
 
             draft_id = storage.create_draft(
                 feed_name=feed_name,
@@ -162,15 +198,34 @@ async def poll_feeds() -> list[str]:
             f"уже видели раньше: {already_seen_count}, новых: {new_from_this_feed}"
         )
 
-    logger.info(f"Итого новых черновиков за проверку: {len(new_draft_ids)}")
+    logger.info(f"Итого новых черновиков из RSS за проверку: {len(new_draft_ids)}")
     return new_draft_ids
+
+
+async def poll_all_sources() -> int:
+    """
+    Проверяет все источники, которые работают по опросу (RSS + Instagram).
+    Telegram-каналы сюда не входят — они работают отдельно, событийно,
+    через юзербот (см. tg_channels_source.py), новые посты оттуда
+    появляются в базе сами по себе, без необходимости их "опрашивать".
+    Возвращает суммарное количество новых черновиков.
+    """
+    rss_ids = await poll_feeds()
+
+    instagram_ids = []
+    if config.INSTAGRAM_ACCOUNTS_TO_MONITOR:
+        instagram_ids = await asyncio.to_thread(poll_instagram)
+        if instagram_ids:
+            logger.info(f"Instagram: новых постов — {len(instagram_ids)}")
+
+    return len(rss_ids) + len(instagram_ids)
 
 
 async def scheduled_poll_feeds():
     """Фоновая проверка по расписанию — просто копит новые черновики, не спамя админа."""
-    new_ids = await poll_feeds()
-    if new_ids:
-        logger.info(f"Найдено новых новостей: {len(new_ids)}. Используй '{BTN_CHECK_FEED}', чтобы их просмотреть.")
+    total_new = await poll_all_sources()
+    if total_new:
+        logger.info(f"Найдено новых новостей: {total_new}. Используй '{BTN_CHECK_FEED}', чтобы их просмотреть.")
 
 
 # ---------- Команды и главное меню ----------
@@ -178,9 +233,9 @@ async def scheduled_poll_feeds():
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
-        "Привет! Я слежу за футбольными RSS-лентами и помогаю тебе публиковать новости в твои каналы.\n\n"
+        "Привет! Я слежу за футбольными источниками и помогаю тебе публиковать новости в твои каналы.\n\n"
         f"«{BTN_CHANNELS}» — управление каналами, куда публикуются новости.\n"
-        f"«{BTN_CHECK_FEED}» — проверить ленты и просмотреть новые новости по одной.",
+        f"«{BTN_CHECK_FEED}» — проверить источники и просмотреть новые новости по одной.",
         reply_markup=main_menu_kb,
     )
 
@@ -203,8 +258,8 @@ async def check_feed(message: Message):
         )
         return
 
-    await message.answer("Проверяю ленты…")
-    await poll_feeds()  # подтягивает самое свежее прямо сейчас
+    await message.answer("Проверяю источники…")
+    await poll_all_sources()  # подтягивает самое свежее прямо сейчас (RSS + Instagram)
 
     # Берём ВСЕ ещё не просмотренные черновики — включая те, что фоновый
     # планировщик уже успел накопить между твоими проверками
@@ -287,7 +342,7 @@ async def handle_approve(callback: CallbackQuery):
         return
 
     await callback.message.edit_caption(
-        caption=draft["text"] + "\n\n👉 В какой канал опубликовать?",
+        caption=truncate_caption(draft["text"], "\n\n👉 В какой канал опубликовать?"),
         reply_markup=channel_choice_keyboard(draft_id),
     )
     await callback.answer()
@@ -305,20 +360,18 @@ async def publish_draft(callback: CallbackQuery, draft_id: str, channel_id: str)
         await callback.answer("Черновик уже обработан или не найден.", show_alert=True)
         return
 
-    caption = draft["text"]
-    if len(caption) > 1024:
-        caption = caption[:1000].rsplit(" ", 1)[0] + "…"
+    caption = truncate_caption(draft["text"])
 
     try:
         await bot.send_photo(
             chat_id=channel_id,
-            photo=draft["image_url"],
+            photo=photo_input(draft["image_url"]),
             caption=caption,
             reply_markup=source_only_keyboard(draft.get("source_link")),
         )
         storage.update_draft_status(draft_id, "approved", published_channel_id=channel_id)
         await callback.message.edit_caption(
-            caption=draft["text"] + f"\n\n✅ ОПУБЛИКОВАНО",
+            caption=truncate_caption(draft["text"], "\n\n✅ ОПУБЛИКОВАНО"),
             reply_markup=source_only_keyboard(draft.get("source_link")),
         )
     except Exception as e:
@@ -338,7 +391,7 @@ async def handle_cancel_publish(callback: CallbackQuery):
         await callback.answer("Черновик не найден.", show_alert=True)
         return
     await callback.message.edit_caption(
-        caption=draft["text"],
+        caption=truncate_caption(draft["text"]),
         reply_markup=moderation_keyboard(draft_id, draft.get("source_link")),
     )
     await callback.answer()
@@ -354,7 +407,10 @@ async def handle_reject(callback: CallbackQuery):
         return
 
     storage.update_draft_status(draft_id, "rejected")
-    await callback.message.edit_caption(caption=draft["text"] + "\n\n❌ ОТКЛОНЕНО", reply_markup=None)
+    await callback.message.edit_caption(
+        caption=truncate_caption(draft["text"], "\n\n❌ ОТКЛОНЕНО"),
+        reply_markup=None,
+    )
     await callback.answer("Отклонено.")
     await send_next_in_queue(callback.from_user.id)
 
@@ -401,6 +457,15 @@ async def main():
     scheduler = AsyncIOScheduler()
     scheduler.add_job(scheduled_poll_feeds, "interval", minutes=config.POLL_INTERVAL_MINUTES)
     scheduler.start()
+
+    if tg_channels_configured():
+        # Подключаем юзербот и запускаем его слушать новые посты фоновой
+        # задачей — параллельно с основным ботом, в том же event loop.
+        # При первом запуске здесь потребуется ввести код подтверждения
+        # из Telegram (и, возможно, пароль от 2FA) прямо в консоли.
+        from tg_channels_source import telethon_client
+        await start_telegram_monitor()
+        asyncio.create_task(telethon_client.run_until_disconnected())
 
     logger.info("Бот запущен.")
     await dp.start_polling(bot)

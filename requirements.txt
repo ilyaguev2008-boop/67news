@@ -5,3 +5,5 @@ beautifulsoup4==4.12.3
 APScheduler==3.10.4
 python-dotenv==1.0.1
 deep-translator==1.11.4
+telethon==1.36.0
+instaloader==4.13.1
