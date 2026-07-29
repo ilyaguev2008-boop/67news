@@ -209,12 +209,29 @@ def translate_text(text: str) -> str:
         return text
 
 
+def pick_headline_icon(title: str) -> str:
+    """
+    Подбирает иконку под заголовок, приближаясь к стилю крупных
+    футбольных Telegram-каналов: цитаты/прямая речь — 🗣, срочные
+    новости/трансферы — 👀, обычные новости — 📰.
+    """
+    lowered = title.lower()
+    quote_markers = [" says", " on ", ":", "'", "\u2018", "\u2019"]
+    transfer_markers = ["transfer", "sign", "deal", "move to", "join"]
+
+    if any(m in lowered for m in quote_markers):
+        return "🗣"
+    if any(m in lowered for m in transfer_markers):
+        return "👀"
+    return "📰"
+
+
 def build_draft_text(entry, article_url: str = "") -> str:
     """
-    Собирает текст поста. Приоритет — полный текст статьи (даёт гораздо
-    больше содержания, чем короткий RSS-summary); если его не удалось
-    достать — используется summary из самой RSS-записи как запасной
-    вариант.
+    Собирает текст поста в стиле коротких карточек футбольных
+    Telegram-каналов: иконка + заголовок, затем короткая цитата/суть
+    в кавычках-«ёлочках» (ARTICLE_MAX_CHARS ограничивает длину — сейчас
+    настроено на ~абзац, а не на полный пересказ статьи).
     """
     title = entry.get("title", "").strip()
     rss_summary = clean_html(entry.get("summary", ""))
@@ -222,10 +239,14 @@ def build_draft_text(entry, article_url: str = "") -> str:
     full_text = extract_article_text(article_url) if article_url else ""
     body = full_text if len(full_text) > len(rss_summary) else rss_summary
 
+    icon = pick_headline_icon(title)
+
     title = translate_text(title)
     body = translate_text(body)
 
-    return f"⚽ {title}\n\n{body}"
+    if body:
+        return f"{icon} {title}\n\n«{body}»"
+    return f"{icon} {title}"
 
 
 def build_entry_content(entry, article_url: str, title: str):
