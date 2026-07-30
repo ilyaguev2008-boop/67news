@@ -129,13 +129,27 @@ def photo_input(image_url: str):
 
 async def send_draft_to_admin(draft: dict):
     caption = truncate_caption(draft["text"])
+    kb = moderation_keyboard(draft["draft_id"], draft.get("source_link"))
 
-    await bot.send_photo(
-        chat_id=config.ADMIN_ID,
-        photo=photo_input(draft["image_url"]),
-        caption=caption,
-        reply_markup=moderation_keyboard(draft["draft_id"], draft.get("source_link")),
-    )
+    try:
+        await bot.send_photo(
+            chat_id=config.ADMIN_ID,
+            photo=photo_input(draft["image_url"]),
+            caption=caption,
+            reply_markup=kb,
+        )
+    except Exception as e:
+        # Если конкретная ссылка на фото всё же оказалась невалидной для
+        # Telegram (например, "wrong type of the web page content") —
+        # не роняем всю проверку новостей, а подставляем плейсхолдер.
+        logger.warning(f"Не удалось отправить фото черновика {draft['draft_id']} ({e}), пробую плейсхолдер")
+        from fetcher import PLACEHOLDER_IMAGE
+        await bot.send_photo(
+            chat_id=config.ADMIN_ID,
+            photo=PLACEHOLDER_IMAGE,
+            caption=caption,
+            reply_markup=kb,
+        )
 
 
 async def send_next_in_queue(admin_id: int):

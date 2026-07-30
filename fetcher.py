@@ -19,6 +19,23 @@ HEADERS = {
 PLACEHOLDER_IMAGE = "https://images.unsplash.com/photo-1508098682722-e99c43a406b2"  # общее фото футбольного мяча
 
 
+def is_valid_image_url(url: str) -> bool:
+    """
+    Проверяет, что ссылка реально отдаёт изображение (Content-Type
+    начинается с 'image/'), а не HTML-страницу, SVG или что-то ещё,
+    что Telegram откажется принять как фото ('wrong type of the web
+    page content'). Используется перед тем, как отдать URL в send_photo.
+    """
+    try:
+        resp = requests.head(url, headers=HEADERS, timeout=8, allow_redirects=True)
+        content_type = resp.headers.get("Content-Type", "")
+        if content_type.startswith("image/") and "svg" not in content_type:
+            return True
+    except requests.RequestException:
+        pass
+    return False
+
+
 def clean_html(raw_html: str) -> str:
     """Убирает HTML-теги из текста RSS summary."""
     if not raw_html:
@@ -126,7 +143,9 @@ def search_wikimedia_image(query: str) -> str | None:
     """
     Бесплатный поиск фото без API-ключа — через Wikimedia Commons.
     Качество/релевантность ниже, чем у Unsplash, но не требует настройки
-    и не привязан к лимитам стороннего платного API.
+    и не привязан к лимитам стороннего платного API. Проверяет несколько
+    кандидатов через is_valid_image_url, чтобы не отдать Telegram
+    битую/невалидную ссылку.
     """
     try:
         resp = requests.get(
@@ -136,7 +155,7 @@ def search_wikimedia_image(query: str) -> str | None:
                 "generator": "search",
                 "gsrsearch": f"{query} football",
                 "gsrnamespace": 6,  # namespace 6 = файлы
-                "gsrlimit": 1,
+                "gsrlimit": 5,
                 "prop": "imageinfo",
                 "iiprop": "url",
                 "iiurlwidth": 1200,
@@ -149,10 +168,13 @@ def search_wikimedia_image(query: str) -> str | None:
         pages = resp.json().get("query", {}).get("pages", {})
         for page in pages.values():
             imageinfo = page.get("imageinfo")
-            if imageinfo:
-                url = imageinfo[0].get("thumburl") or imageinfo[0].get("url")
-                if url and url.lower().endswith((".jpg", ".jpeg", ".png")):
-                    return url
+            if not imageinfo:
+                continue
+            url = imageinfo[0].get("thumburl") or imageinfo[0].get("url")
+            if not url or not url.lower().endswith((".jpg", ".jpeg", ".png")):
+                continue
+            if is_valid_image_url(url):
+                return url
     except requests.RequestException as e:
         logger.warning(f"Wikimedia-поиск не сработал: {e}")
     return None
@@ -179,7 +201,9 @@ def search_fallback_image(query: str) -> str:
             resp.raise_for_status()
             results = resp.json().get("results", [])
             if results:
-                return results[0]["urls"]["regular"]
+                url = results[0]["urls"]["regular"]
+                if is_valid_image_url(url):
+                    return url
         except requests.RequestException as e:
             logger.warning(f"Unsplash fallback не сработал: {e}")
 
