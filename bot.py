@@ -37,6 +37,12 @@ dp = Dispatcher(storage=MemoryStorage())
 # Очередь черновиков на проверку для каждого админа: {admin_id: [draft_id, draft_id, ...]}
 review_queues: dict[int, list[str]] = {}
 
+# Не даёт двум проверкам источников (фоновой по расписанию и ручной по
+# кнопке) идти одновременно — иначе при 23 источниках + скачивании
+# текста/фото/перевода один проход может не уложиться в
+# POLL_INTERVAL_MINUTES, и следующий запуск стартует поверх ещё идущего.
+poll_lock = asyncio.Lock()
+
 BTN_CHANNELS = "📋 Мои каналы"
 BTN_CHECK_FEED = "🔄 Проверить ленту новостей"
 
@@ -138,16 +144,27 @@ async def send_draft_to_admin(draft: dict):
             caption=caption,
             reply_markup=kb,
         )
+        return
     except Exception as e:
-        # Если конкретная ссылка на фото всё же оказалась невалидной для
-        # Telegram (например, "wrong type of the web page content") —
-        # не роняем всю проверку новостей, а подставляем плейсхолдер.
         logger.warning(f"Не удалось отправить фото черновика {draft['draft_id']} ({e}), пробую плейсхолдер")
+
+    try:
         from fetcher import PLACEHOLDER_IMAGE
         await bot.send_photo(
             chat_id=config.ADMIN_ID,
             photo=PLACEHOLDER_IMAGE,
             caption=caption,
+            reply_markup=kb,
+        )
+        return
+    except Exception as e:
+        # Даже плейсхолдер иногда не проходит (временный сбой на стороне
+        # Telegram) — последний рубеж: отправляем просто текст без фото,
+        # чтобы проверка новостей не падала целиком и очередь двигалась дальше.
+        logger.warning(f"Плейсхолдер тоже не отправился ({e}), шлю текстом без фото")
+        await bot.send_message(
+            chat_id=config.ADMIN_ID,
+            text=caption,
             reply_markup=kb,
         )
 
@@ -223,16 +240,22 @@ async def poll_all_sources() -> int:
     через юзербот (см. tg_channels_source.py), новые посты оттуда
     появляются в базе сами по себе, без необходимости их "опрашивать".
     Возвращает суммарное количество новых черновиков.
+
+    Использует poll_lock: если проверка уже идёт (фоновая по расписанию
+    или другая ручная по кнопке), новый вызов просто дождётся её
+    завершения вместо того, чтобы стартовать ещё один параллельный
+    проход по тем же 23 источникам.
     """
-    rss_ids = await poll_feeds()
+    async with poll_lock:
+        rss_ids = await poll_feeds()
 
-    instagram_ids = []
-    if config.INSTAGRAM_ACCOUNTS_TO_MONITOR:
-        instagram_ids = await asyncio.to_thread(poll_instagram)
-        if instagram_ids:
-            logger.info(f"Instagram: новых постов — {len(instagram_ids)}")
+        instagram_ids = []
+        if config.INSTAGRAM_ACCOUNTS_TO_MONITOR:
+            instagram_ids = await asyncio.to_thread(poll_instagram)
+            if instagram_ids:
+                logger.info(f"Instagram: новых постов — {len(instagram_ids)}")
 
-    return len(rss_ids) + len(instagram_ids)
+        return len(rss_ids) + len(instagram_ids)
 
 
 async def scheduled_poll_feeds():
