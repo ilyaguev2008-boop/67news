@@ -146,27 +146,18 @@ async def send_draft_to_admin(draft: dict):
         )
         return
     except Exception as e:
-        logger.warning(f"Не удалось отправить фото черновика {draft['draft_id']} ({e}), пробую плейсхолдер")
+        logger.warning(f"Не удалось отправить фото черновика {draft['draft_id']} ({e}), пробую локальный плейсхолдер")
 
-    try:
-        from fetcher import PLACEHOLDER_IMAGE
-        await bot.send_photo(
-            chat_id=config.ADMIN_ID,
-            photo=PLACEHOLDER_IMAGE,
-            caption=caption,
-            reply_markup=kb,
-        )
-        return
-    except Exception as e:
-        # Даже плейсхолдер иногда не проходит (временный сбой на стороне
-        # Telegram) — последний рубеж: отправляем просто текст без фото,
-        # чтобы проверка новостей не падала целиком и очередь двигалась дальше.
-        logger.warning(f"Плейсхолдер тоже не отправился ({e}), шлю текстом без фото")
-        await bot.send_message(
-            chat_id=config.ADMIN_ID,
-            text=caption,
-            reply_markup=kb,
-        )
+    # Локальный файл-плейсхолдер (media/placeholder.jpg) — не ссылка в
+    # интернете, а файл прямо в проекте. Telegram получает его как
+    # загруженный файл, а не забирает по URL, так что типичная ошибка
+    # "wrong type of the web page content" здесь невозможна в принципе.
+    await bot.send_photo(
+        chat_id=config.ADMIN_ID,
+        photo=FSInputFile(config.LOCAL_PLACEHOLDER_PATH),
+        caption=caption,
+        reply_markup=kb,
+    )
 
 
 async def send_next_in_queue(admin_id: int):
@@ -398,23 +389,34 @@ async def publish_draft(callback: CallbackQuery, draft_id: str, channel_id: str)
         return
 
     caption = truncate_caption(draft["text"])
+    source_kb = source_only_keyboard(draft.get("source_link"))
 
     try:
         await bot.send_photo(
             chat_id=channel_id,
             photo=photo_input(draft["image_url"]),
             caption=caption,
-            reply_markup=source_only_keyboard(draft.get("source_link")),
-        )
-        storage.update_draft_status(draft_id, "approved", published_channel_id=channel_id)
-        await callback.message.edit_caption(
-            caption=truncate_caption(draft["text"], "\n\n✅ ОПУБЛИКОВАНО"),
-            reply_markup=source_only_keyboard(draft.get("source_link")),
+            reply_markup=source_kb,
         )
     except Exception as e:
-        logger.error(f"Ошибка публикации в канал {channel_id}: {e}")
-        await callback.answer(f"Ошибка публикации: {e}", show_alert=True)
-        return
+        logger.warning(f"Не удалось опубликовать фото в канал {channel_id} ({e}), пробую локальный плейсхолдер")
+        try:
+            await bot.send_photo(
+                chat_id=channel_id,
+                photo=FSInputFile(config.LOCAL_PLACEHOLDER_PATH),
+                caption=caption,
+                reply_markup=source_kb,
+            )
+        except Exception as e2:
+            logger.error(f"Ошибка публикации в канал {channel_id}: {e2}")
+            await callback.answer(f"Ошибка публикации: {e2}", show_alert=True)
+            return
+
+    storage.update_draft_status(draft_id, "approved", published_channel_id=channel_id)
+    await callback.message.edit_caption(
+        caption=truncate_caption(draft["text"], "\n\n✅ ОПУБЛИКОВАНО"),
+        reply_markup=source_kb,
+    )
 
     await callback.answer("Опубликовано!")
     await send_next_in_queue(callback.from_user.id)
