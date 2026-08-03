@@ -257,12 +257,33 @@ def get_image_for_entry(entry, article_url: str, search_query: str) -> str:
     return search_fallback_image(search_query)
 
 
+# Признаки того, что вместо реальной статьи загрузилась страница с
+# ошибкой сервера/капчей/заглушкой — такой "контент" не должен попадать
+# в текст поста.
+_ERROR_PAGE_MARKERS = [
+    "error 500", "server error", "please try again later",
+    "that's all we know", "access denied", "403 forbidden",
+    "404 not found", "page not found", "captcha",
+]
+
+
+def _looks_like_error_page(text: str) -> bool:
+    """True, если извлечённый текст похож на страницу с ошибкой, а не на статью."""
+    lowered = text.lower()
+    # Короткий текст с явным маркером ошибки — почти наверняка не статья
+    return len(text) < 600 and any(marker in lowered for marker in _ERROR_PAGE_MARKERS)
+
+
 def extract_article_text(article_url: str, max_chars: int = None) -> str:
     """
     Заходит на страницу статьи и собирает основной текст (абзацы <p>).
     Отсекает короткие служебные строки (меню, подписи под фото и т.п.),
     оставляя только содержательные абзацы. Обрезает по max_chars
-    (по умолчанию — config.ARTICLE_MAX_CHARS).
+    (по умолчанию — config.ARTICLE_MAX_CHARS). Если вместо статьи
+    загрузилась страница с ошибкой сервера (сайт-источник в моменте
+    отдал 200 OK с текстом вроде "Error 500... try again later") —
+    возвращает пустую строку, чтобы вызывающий код взял запасной текст
+    из RSS summary вместо этого мусора.
     """
     if max_chars is None:
         max_chars = ARTICLE_MAX_CHARS
@@ -281,6 +302,10 @@ def extract_article_text(article_url: str, max_chars: int = None) -> str:
     # оставляем только содержательные абзацы — короткие строки обычно навигация/подписи
     meaningful = [p for p in paragraphs if len(p) > 40]
     text = " ".join(meaningful)
+
+    if _looks_like_error_page(text):
+        logger.warning(f"Похоже на страницу с ошибкой вместо статьи ({article_url}), беру RSS summary")
+        return ""
 
     if len(text) > max_chars:
         text = text[:max_chars].rsplit(" ", 1)[0] + "…"
@@ -402,8 +427,19 @@ def build_entry_content(entry, article_url: str, title: str):
     определяем игроков/клубы (pick_image_search_query) -> ищем фото
     именно по ним, а не по общей теме -> уже потом переводим текст для
     самого поста.
+
+    Возвращает (None, None), если сама RSS-запись выглядит как сбой
+    сайта-источника (например, заголовок вида "Error 500... try again
+    later" — временная страница с ошибкой попала в ленту вместо реальной
+    новости). Вызывающий код в этом случае должен пропустить такую
+    запись, не создавая из неё черновик.
     """
     title_en = entry.get("title", "").strip()
+
+    if _looks_like_error_page(title_en):
+        logger.warning(f"Заголовок похож на страницу с ошибкой сайта-источника, пропускаю запись: {title_en!r}")
+        return None, None
+
     rss_summary_en = clean_html(entry.get("summary", ""))
 
     full_text_en = extract_article_text(article_url) if article_url else ""

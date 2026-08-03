@@ -204,6 +204,15 @@ async def poll_feeds() -> list[str]:
                 build_entry_content, entry, article_url, title
             )
 
+            # (None, None) — сама запись оказалась сбойной страницей с
+            # ошибкой сайта-источника, а не настоящей новостью. Помечаем
+            # как просмотренную (чтобы не пытаться повторно каждую
+            # проверку), но черновик не создаём.
+            if text is None:
+                storage.mark_entry_seen(eid, feed_name)
+                already_seen_count += 1
+                continue
+
             draft_id = storage.create_draft(
                 feed_name=feed_name,
                 source_link=article_url,
