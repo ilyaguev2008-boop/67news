@@ -8,7 +8,7 @@ import requests
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
 
-from config import UNSPLASH_ACCESS_KEY, MAX_ENTRIES_PER_FEED, TRANSLATE_TO, LOOKBACK_HOURS, ARTICLE_MAX_CHARS, USE_SOURCE_IMAGES
+from config import UNSPLASH_ACCESS_KEY, MAX_ENTRIES_PER_FEED, TRANSLATE_TO, LOOKBACK_HOURS, ARTICLE_MAX_CHARS, USE_SOURCE_IMAGES, FEEDS
 
 logger = logging.getLogger(__name__)
 
@@ -139,13 +139,32 @@ def extract_image_from_article(article_url: str) -> str | None:
     return None
 
 
+# Признаки в названии файла, по которым отсеиваем вероятные скриншоты
+# статей, газетные вырезки, обложки изданий — то, где почти наверняка
+# будет чужой заголовок или логотип издания, а не нейтральное фото.
+_UNWANTED_FILENAME_MARKERS = [
+    "newspaper", "headline", "front page", "frontpage", "cover",
+    "magazine", "article", "clipping", "press", "screenshot",
+    "logo", "wordmark", "masthead", "газет", "заголов", "обложк",
+]
+
+
+def _looks_like_editorial_content(title: str) -> bool:
+    """True, если название файла намекает на газетную вырезку/скриншот/обложку."""
+    lowered = title.lower()
+    return any(marker in lowered for marker in _UNWANTED_FILENAME_MARKERS)
+
+
 def search_wikimedia_image(query: str) -> str | None:
     """
     Бесплатный поиск фото без API-ключа — через Wikimedia Commons.
     Качество/релевантность ниже, чем у Unsplash, но не требует настройки
     и не привязан к лимитам стороннего платного API. Проверяет несколько
     кандидатов через is_valid_image_url, чтобы не отдать Telegram
-    битую/невалидную ссылку.
+    битую/невалидную ссылку, и пропускает файлы, чьё название намекает
+    на газетную вырезку/скриншот/обложку издания (см.
+    _looks_like_editorial_content) — там почти наверняка будет чужой
+    заголовок или логотип, а не нейтральное фото.
     """
     try:
         resp = requests.get(
@@ -155,7 +174,7 @@ def search_wikimedia_image(query: str) -> str | None:
                 "generator": "search",
                 "gsrsearch": f"{query} football",
                 "gsrnamespace": 6,  # namespace 6 = файлы
-                "gsrlimit": 5,
+                "gsrlimit": 8,
                 "prop": "imageinfo",
                 "iiprop": "url",
                 "iiurlwidth": 1200,
@@ -167,6 +186,10 @@ def search_wikimedia_image(query: str) -> str | None:
         resp.raise_for_status()
         pages = resp.json().get("query", {}).get("pages", {})
         for page in pages.values():
+            page_title = page.get("title", "")
+            if _looks_like_editorial_content(page_title):
+                continue
+
             imageinfo = page.get("imageinfo")
             if not imageinfo:
                 continue
@@ -194,14 +217,16 @@ def search_fallback_image(query: str) -> str:
         try:
             resp = requests.get(
                 "https://api.unsplash.com/search/photos",
-                params={"query": query, "per_page": 1, "orientation": "landscape"},
+                params={"query": query, "per_page": 5, "orientation": "landscape"},
                 headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"},
                 timeout=10,
             )
             resp.raise_for_status()
-            results = resp.json().get("results", [])
-            if results:
-                url = results[0]["urls"]["regular"]
+            for photo in resp.json().get("results", []):
+                description = f"{photo.get('description') or ''} {photo.get('alt_description') or ''}"
+                if _looks_like_editorial_content(description):
+                    continue
+                url = photo["urls"]["regular"]
                 if is_valid_image_url(url):
                     return url
         except requests.RequestException as e:
@@ -210,14 +235,16 @@ def search_fallback_image(query: str) -> str:
     return PLACEHOLDER_IMAGE
 
 
-def get_image_for_entry(entry, article_url: str, title: str) -> str:
+def get_image_for_entry(entry, article_url: str, search_query: str) -> str:
     """
     По умолчанию НЕ берёт фото со страницы источника (og:image) и не
     берёт миниатюру из RSS — у крупных изданий (BBC, Sky и т.п.) эти
     фото почти всегда содержат их логотип/вотермарку. Вместо этого сразу
     ищет нейтральное фото по теме в интернете (Wikimedia Commons /
-    Unsplash). Если понадобится вернуть старое поведение — см.
-    config.USE_SOURCE_IMAGES.
+    Unsplash), используя search_query — как правило, имя футболиста и/или
+    название клуба, извлечённые из текста новости (см.
+    pick_image_search_query), а не общий заголовок. Если понадобится
+    вернуть старое поведение — см. config.USE_SOURCE_IMAGES.
     """
     if USE_SOURCE_IMAGES:
         image = extract_image_from_article(article_url)
@@ -227,7 +254,7 @@ def get_image_for_entry(entry, article_url: str, title: str) -> str:
         if image:
             return image
 
-    return search_fallback_image(title)
+    return search_fallback_image(search_query)
 
 
 def extract_article_text(article_url: str, max_chars: int = None) -> str:
@@ -297,36 +324,98 @@ def pick_headline_icon(title: str) -> str:
     return "📰"
 
 
-def build_draft_text(entry, article_url: str = "") -> str:
+def _known_club_names() -> list[str]:
+    """Список названий клубов — берётся из твоих же источников в config.FEEDS."""
+    names = []
+    for label, _ in FEEDS:
+        club = label.split("—")[0].strip()
+        if club and "целом" not in club.lower():
+            names.append(club)
+    return names
+
+
+CLUB_NAMES = _known_club_names()
+
+_NAME_STOPWORDS = {
+    "The", "This", "That", "After", "Before", "During", "According",
+    "However", "Meanwhile", "Following", "Despite", "Manchester",
+}
+
+
+def find_club_mention(text: str) -> str | None:
+    """Ищет упоминание клуба (из CLUB_NAMES) в тексте."""
+    lowered = text.lower()
+    for club in CLUB_NAMES:
+        if club.lower() in lowered:
+            return club
+    return None
+
+
+def find_player_name(text: str) -> str | None:
     """
-    Собирает текст поста в стиле коротких карточек футбольных
-    Telegram-каналов: иконка + заголовок, затем короткая цитата/суть
-    в кавычках-«ёлочках» (ARTICLE_MAX_CHARS ограничивает длину — сейчас
-    настроено на ~абзац, а не на полный пересказ статьи).
+    Простая эвристика для имени футболиста: два подряд идущих слова с
+    заглавной буквы (типичный паттерн "Имя Фамилия" в англоязычном
+    заголовке) — исключая уже известные названия клубов и служебные
+    слова.
     """
-    title = entry.get("title", "").strip()
-    rss_summary = clean_html(entry.get("summary", ""))
+    candidates = re.findall(r"\b[A-Z][a-zA-Z'\-]+ [A-Z][a-zA-Z'\-]+\b", text)
+    for candidate in candidates:
+        first_word = candidate.split()[0]
+        if first_word in _NAME_STOPWORDS:
+            continue
+        if any(candidate.lower() in club.lower() or club.lower() in candidate.lower() for club in CLUB_NAMES):
+            continue
+        return candidate
+    return None
 
-    full_text = extract_article_text(article_url) if article_url else ""
-    body = full_text if len(full_text) > len(rss_summary) else rss_summary
 
-    icon = pick_headline_icon(title)
+def pick_image_search_query(title_en: str, body_en: str, fallback: str) -> str:
+    """
+    Шаг 2 и 3 алгоритма: разбирает текст новости (заголовок + начало
+    статьи, на английском — до перевода, так эвристика по заглавным
+    буквам работает надёжнее) и определяет, каких футболистов/клубы она
+    касается. Приоритет для поиска фото: конкретный игрок > клуб >
+    исходный заголовок как крайний случай, если ни то ни другое не нашлось.
+    """
+    combined = f"{title_en} {body_en[:300]}"
 
-    title = translate_text(title)
-    body = translate_text(body)
+    player = find_player_name(title_en) or find_player_name(combined)
+    club = find_club_mention(combined)
 
-    if body:
-        return f"{icon} {title}\n\n«{body}»"
-    return f"{icon} {title}"
+    if player and club:
+        return f"{player} {club}"
+    if player:
+        return player
+    if club:
+        return club
+    return fallback
 
 
 def build_entry_content(entry, article_url: str, title: str):
     """
-    Объединяет весь тяжёлый блокирующий сетевой труд по одной новости
-    (текст статьи + перевод + поиск фото) в один вызов — чтобы вызывающий
-    код мог отдать его целиком в отдельный поток через asyncio.to_thread
-    и не блокировать event loop бота на время сетевых запросов.
+    Шаг 1 алгоритма (чтение и анализ поста) + сборка текста и подбор
+    фото в один блокирующий проход — чтобы вызывающий код мог отдать его
+    целиком в отдельный поток через asyncio.to_thread и не блокировать
+    event loop бота на время сетевых запросов.
+
+    Порядок: читаем заголовок и текст статьи (на английском) -> из них
+    определяем игроков/клубы (pick_image_search_query) -> ищем фото
+    именно по ним, а не по общей теме -> уже потом переводим текст для
+    самого поста.
     """
-    text = build_draft_text(entry, article_url)
-    image_url = get_image_for_entry(entry, article_url, title)
+    title_en = entry.get("title", "").strip()
+    rss_summary_en = clean_html(entry.get("summary", ""))
+
+    full_text_en = extract_article_text(article_url) if article_url else ""
+    body_en = full_text_en if len(full_text_en) > len(rss_summary_en) else rss_summary_en
+
+    search_query = pick_image_search_query(title_en, body_en, fallback=title_en)
+    image_url = get_image_for_entry(entry, article_url, search_query)
+
+    icon = pick_headline_icon(title_en)
+    title_ru = translate_text(title_en)
+    body_ru = translate_text(body_en)
+
+    text = f"{icon} {title_ru}\n\n«{body_ru}»" if body_ru else f"{icon} {title_ru}"
+
     return text, image_url
