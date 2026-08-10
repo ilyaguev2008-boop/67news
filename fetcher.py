@@ -146,7 +146,19 @@ _UNWANTED_FILENAME_MARKERS = [
     "newspaper", "headline", "front page", "frontpage", "cover",
     "magazine", "article", "clipping", "press", "screenshot",
     "logo", "wordmark", "masthead", "газет", "заголов", "обложк",
+    # Значки/иконки/схемы — тоже не фото человека или события
+    "icon", "loudspeaker", "speaker icon", "audio", "pronunciation",
+    "symbol", "diagram", "flag of", "coat of arms", "crest", "emblem",
+    "map of", "wikimedia", "commons-logo", "question mark", "no image",
+    "placeholder",
 ]
+
+# Расширения файлов, которые почти никогда не бывают настоящей фотографией
+# на Wikimedia Commons (значки, схемы, звук, видео — они хранятся как SVG,
+# GIF, OGG и т.п., даже если Wikimedia сгенерировала для них PNG/JPG превью
+# по нашему запросу iiurlwidth). Проверяем именно оригинальное расширение
+# в названии файла (page title вида "File:Name.ext"), а не превью-ссылку.
+_NON_PHOTO_EXTENSIONS = (".svg", ".gif", ".ogg", ".ogv", ".webm", ".ico")
 
 
 def _looks_like_editorial_content(title: str) -> bool:
@@ -187,7 +199,13 @@ def search_wikimedia_image(query: str) -> str | None:
         pages = resp.json().get("query", {}).get("pages", {})
         for page in pages.values():
             page_title = page.get("title", "")
+
             if _looks_like_editorial_content(page_title):
+                continue
+            if page_title.lower().endswith(_NON_PHOTO_EXTENSIONS):
+                # Значок/схема/звук с автосгенерированным PNG-превью —
+                # не настоящая фотография, пропускаем, несмотря на то что
+                # thumburl формально пройдёт проверку по расширению .png/.jpg
                 continue
 
             imageinfo = page.get("imageinfo")
