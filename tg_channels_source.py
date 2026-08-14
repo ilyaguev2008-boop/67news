@@ -9,8 +9,6 @@ logger = logging.getLogger(__name__)
 
 MEDIA_DIR = config.MEDIA_DIR
 
-# Клиент создаётся только если заданы API-ключи — иначе модуль просто
-# ничего не делает, не мешая остальным источникам работать.
 telethon_client = None
 
 if config.TELEGRAM_API_ID and config.TELEGRAM_API_HASH:
@@ -34,8 +32,6 @@ async def _handle_new_message(event):
 
         text = (message.message or "").strip()
         if not text:
-            # пост без текста (например, чистое фото без подписи) — пропускаем,
-            # у нас нет что переводить и показывать
             storage.mark_entry_seen(eid, "telegram-channel")
             return
 
@@ -69,12 +65,6 @@ async def _handle_new_message(event):
 
 
 async def start_telegram_monitor():
-    """
-    Подключает юзербот-клиент и подписывается на новые сообщения из
-    TELEGRAM_CHANNELS_TO_MONITOR. При первом запуске потребует ввести код
-    подтверждения (и, если включена 2FA, пароль) прямо в консоли.
-    Ничего не делает, если API-ключи или список каналов не заданы.
-    """
     if not is_configured():
         logger.info(
             "Мониторинг чужих Telegram-каналов выключен "

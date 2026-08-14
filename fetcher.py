@@ -24,7 +24,7 @@ def is_valid_image_url(url: str) -> bool:
     Проверяет, что ссылка реально отдаёт изображение (Content-Type
     начинается с 'image/'), а не HTML-страницу, SVG или что-то ещё,
     что Telegram откажется принять как фото ('wrong type of the web
-    page content'). Используется перед тем, как отдать URL в send_photo.
+    page content').
     """
     try:
         resp = requests.head(url, headers=HEADERS, timeout=8, allow_redirects=True)
@@ -54,15 +54,10 @@ def _entry_published_dt(entry):
 
 def fetch_feed_entries(feed_url: str):
     """
-    Возвращает записи RSS-ленты за последние LOOKBACK_HOURS часов
-    (config.py). Записи без даты публикации в RSS не отбрасываются —
-    попадают в выдачу как есть. Ограничено MAX_ENTRIES_PER_FEED.
-
+    Возвращает записи RSS-ленты за последние LOOKBACK_HOURS часов.
     Лента скачивается через requests (а не напрямую через
-    feedparser.parse(url)) — у requests свой пакет сертификатов (certifi),
-    независимый от системных настроек Python. Это обходит ошибку
-    SSL: CERTIFICATE_VERIFY_FAILED, характерную для Python на macOS,
-    поставленного через python.org-инсталлятор.
+    feedparser.parse(url)) — обходит ошибку SSL: CERTIFICATE_VERIFY_FAILED,
+    характерную для Python на macOS.
     """
     try:
         response = requests.get(feed_url, headers=HEADERS, timeout=15)
@@ -140,13 +135,12 @@ def extract_image_from_article(article_url: str) -> str | None:
 
 
 # Признаки в названии файла, по которым отсеиваем вероятные скриншоты
-# статей, газетные вырезки, обложки изданий — то, где почти наверняка
-# будет чужой заголовок или логотип издания, а не нейтральное фото.
+# статей, газетные вырезки, обложки изданий, иконки/значки — то, где
+# почти наверняка будет чужой заголовок/логотип, а не нейтральное фото.
 _UNWANTED_FILENAME_MARKERS = [
     "newspaper", "headline", "front page", "frontpage", "cover",
     "magazine", "article", "clipping", "press", "screenshot",
     "logo", "wordmark", "masthead", "газет", "заголов", "обложк",
-    # Значки/иконки/схемы — тоже не фото человека или события
     "icon", "loudspeaker", "speaker icon", "audio", "pronunciation",
     "symbol", "diagram", "flag of", "coat of arms", "crest", "emblem",
     "map of", "wikimedia", "commons-logo", "question mark", "no image",
@@ -154,29 +148,82 @@ _UNWANTED_FILENAME_MARKERS = [
 ]
 
 # Расширения файлов, которые почти никогда не бывают настоящей фотографией
-# на Wikimedia Commons (значки, схемы, звук, видео — они хранятся как SVG,
-# GIF, OGG и т.п., даже если Wikimedia сгенерировала для них PNG/JPG превью
-# по нашему запросу iiurlwidth). Проверяем именно оригинальное расширение
-# в названии файла (page title вида "File:Name.ext"), а не превью-ссылку.
+# на Wikimedia Commons (значки, схемы, звук, видео).
 _NON_PHOTO_EXTENSIONS = (".svg", ".gif", ".ogg", ".ogv", ".webm", ".ico")
 
 
 def _looks_like_editorial_content(title: str) -> bool:
-    """True, если название файла намекает на газетную вырезку/скриншот/обложку."""
+    """True, если название файла намекает на газетную вырезку/скриншот/обложку/иконку."""
     lowered = title.lower()
     return any(marker in lowered for marker in _UNWANTED_FILENAME_MARKERS)
 
 
+# Признаки того, что вместо реальной статьи загрузилась страница с
+# ошибкой сервера/капчей/заглушкой.
+_ERROR_PAGE_MARKERS = [
+    "error 500", "server error", "please try again later",
+    "that's all we know", "access denied", "403 forbidden",
+    "404 not found", "page not found", "captcha",
+]
+
+
+def _looks_like_error_page(text: str) -> bool:
+    """True, если извлечённый текст похож на страницу с ошибкой, а не на статью."""
+    lowered = text.lower()
+    return len(text) < 600 and any(marker in lowered for marker in _ERROR_PAGE_MARKERS)
+
+
+def search_wikipedia_person_photo(name: str) -> str | None:
+    """
+    Самый точный источник для КОНКРЕТНОГО человека: запрашивает у Wikipedia
+    статью по имени и забирает её "pageimage" — фото из карточки статьи.
+    У футболистов (даже не самых известных — уровня второго/третьего
+    эшелона), если у них вообще есть статья в Wikipedia, почти всегда
+    есть и фото в карточке. Это гораздо точнее, чем полнотекстовый поиск
+    по файлам на Wikimedia Commons, который выше по шансам возвращает
+    нерелевантный результат.
+    """
+    if not name:
+        return None
+    try:
+        resp = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "query",
+                "titles": name,
+                "prop": "pageimages",
+                "piprop": "thumbnail",
+                "pithumbsize": 1000,
+                "redirects": 1,
+                "format": "json",
+            },
+            headers=HEADERS,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        pages = resp.json().get("query", {}).get("pages", {})
+        for page in pages.values():
+            if "missing" in page:
+                continue
+            thumbnail = page.get("thumbnail")
+            if not thumbnail:
+                continue
+            url = thumbnail.get("source")
+            if not url or not url.lower().endswith((".jpg", ".jpeg", ".png")):
+                continue
+            if is_valid_image_url(url):
+                return url
+    except requests.RequestException as e:
+        logger.warning(f"Wikipedia pageimage-поиск не сработал ({name!r}): {e}")
+    return None
+
+
 def search_wikimedia_image(query: str) -> str | None:
     """
-    Бесплатный поиск фото без API-ключа — через Wikimedia Commons.
-    Качество/релевантность ниже, чем у Unsplash, но не требует настройки
-    и не привязан к лимитам стороннего платного API. Проверяет несколько
-    кандидатов через is_valid_image_url, чтобы не отдать Telegram
-    битую/невалидную ссылку, и пропускает файлы, чьё название намекает
-    на газетную вырезку/скриншот/обложку издания (см.
-    _looks_like_editorial_content) — там почти наверняка будет чужой
-    заголовок или логотип, а не нейтральное фото.
+    Полнотекстовый поиск по файлам Wikimedia Commons — запасной вариант,
+    когда прямой поиск статьи в Wikipedia (search_wikipedia_person_photo)
+    не сработал (например, запрос — не имя конкретного человека, а
+    название клуба или тема новости).
     """
     try:
         resp = requests.get(
@@ -203,9 +250,6 @@ def search_wikimedia_image(query: str) -> str | None:
             if _looks_like_editorial_content(page_title):
                 continue
             if page_title.lower().endswith(_NON_PHOTO_EXTENSIONS):
-                # Значок/схема/звук с автосгенерированным PNG-превью —
-                # не настоящая фотография, пропускаем, несмотря на то что
-                # thumburl формально пройдёт проверку по расширению .png/.jpg
                 continue
 
             imageinfo = page.get("imageinfo")
@@ -221,48 +265,79 @@ def search_wikimedia_image(query: str) -> str | None:
     return None
 
 
-def search_fallback_image(query: str) -> str:
+def search_unsplash_image(query: str) -> str | None:
+    """Поиск через Unsplash — требует API-ключ (config.UNSPLASH_ACCESS_KEY)."""
+    if not UNSPLASH_ACCESS_KEY:
+        return None
+    try:
+        resp = requests.get(
+            "https://api.unsplash.com/search/photos",
+            params={"query": query, "per_page": 5, "orientation": "landscape"},
+            headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        for photo in resp.json().get("results", []):
+            description = f"{photo.get('description') or ''} {photo.get('alt_description') or ''}"
+            if _looks_like_editorial_content(description):
+                continue
+            url = photo["urls"]["regular"]
+            if is_valid_image_url(url):
+                return url
+    except requests.RequestException as e:
+        logger.warning(f"Unsplash fallback не сработал: {e}")
+    return None
+
+
+def search_fallback_image(query: str, person_name: str = "") -> str:
     """
-    Ищет фото по теме в интернете — сначала Wikimedia Commons (бесплатно,
-    без ключа), затем Unsplash (если задан UNSPLASH_ACCESS_KEY), и только
-    если оба варианта не дали результата — общий плейсхолдер.
+    Ищет фото по теме в интернете. Если известно конкретное имя
+    футболиста (person_name) — сначала пробует точный портрет через
+    Wikipedia pageimage (самый релевантный источник для человека), потом
+    общий поиск по Wikimedia Commons, и в конце Unsplash (если задан
+    ключ). Возвращает общий плейсхолдер, только если вообще ничего не
+    нашлось.
     """
+    if person_name:
+        image = search_wikipedia_person_photo(person_name)
+        if image:
+            return image
+
     image = search_wikimedia_image(query)
     if image:
         return image
 
-    if UNSPLASH_ACCESS_KEY:
-        try:
-            resp = requests.get(
-                "https://api.unsplash.com/search/photos",
-                params={"query": query, "per_page": 5, "orientation": "landscape"},
-                headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            for photo in resp.json().get("results", []):
-                description = f"{photo.get('description') or ''} {photo.get('alt_description') or ''}"
-                if _looks_like_editorial_content(description):
-                    continue
-                url = photo["urls"]["regular"]
-                if is_valid_image_url(url):
-                    return url
-        except requests.RequestException as e:
-            logger.warning(f"Unsplash fallback не сработал: {e}")
+    image = search_unsplash_image(query)
+    if image:
+        return image
 
     return PLACEHOLDER_IMAGE
 
 
-def get_image_for_entry(entry, article_url: str, search_query: str) -> str:
+def search_image_with_broadening(specific_query: str, broader_query: str, person_name: str = "") -> str:
+    """
+    Малоизвестные игроки/клубы часто не находятся по точному запросу —
+    пробуем сузить поиск постепенно: сначала точный запрос (с приоритетом
+    на точный портрет игрока, если есть имя), затем более общий запрос
+    (обычно клуб или "football"), и только если совсем ничего не нашлось
+    — общий плейсхолдер.
+    """
+    if specific_query and specific_query != broader_query:
+        image = search_fallback_image(specific_query, person_name=person_name)
+        if image != PLACEHOLDER_IMAGE:
+            return image
+
+    return search_fallback_image(broader_query or "football")
+
+
+def get_image_for_entry(entry, article_url: str, search_query: str, broader_query: str = "", person_name: str = "") -> str:
     """
     По умолчанию НЕ берёт фото со страницы источника (og:image) и не
-    берёт миниатюру из RSS — у крупных изданий (BBC, Sky и т.п.) эти
-    фото почти всегда содержат их логотип/вотермарку. Вместо этого сразу
-    ищет нейтральное фото по теме в интернете (Wikimedia Commons /
-    Unsplash), используя search_query — как правило, имя футболиста и/или
-    название клуба, извлечённые из текста новости (см.
-    pick_image_search_query), а не общий заголовок. Если понадобится
-    вернуть старое поведение — см. config.USE_SOURCE_IMAGES.
+    берёт миниатюру из RSS — у крупных изданий эти фото почти всегда
+    содержат их логотип/вотермарку. Вместо этого ищет нейтральное фото
+    по теме в интернете, с приоритетом на точный портрет конкретного
+    футболиста (см. search_fallback_image). Если понадобится вернуть
+    старое поведение — см. config.USE_SOURCE_IMAGES.
     """
     if USE_SOURCE_IMAGES:
         image = extract_image_from_article(article_url)
@@ -272,36 +347,14 @@ def get_image_for_entry(entry, article_url: str, search_query: str) -> str:
         if image:
             return image
 
-    return search_fallback_image(search_query)
-
-
-# Признаки того, что вместо реальной статьи загрузилась страница с
-# ошибкой сервера/капчей/заглушкой — такой "контент" не должен попадать
-# в текст поста.
-_ERROR_PAGE_MARKERS = [
-    "error 500", "server error", "please try again later",
-    "that's all we know", "access denied", "403 forbidden",
-    "404 not found", "page not found", "captcha",
-]
-
-
-def _looks_like_error_page(text: str) -> bool:
-    """True, если извлечённый текст похож на страницу с ошибкой, а не на статью."""
-    lowered = text.lower()
-    # Короткий текст с явным маркером ошибки — почти наверняка не статья
-    return len(text) < 600 and any(marker in lowered for marker in _ERROR_PAGE_MARKERS)
+    return search_image_with_broadening(search_query, broader_query or search_query, person_name=person_name)
 
 
 def extract_article_text(article_url: str, max_chars: int = None) -> str:
     """
     Заходит на страницу статьи и собирает основной текст (абзацы <p>).
-    Отсекает короткие служебные строки (меню, подписи под фото и т.п.),
-    оставляя только содержательные абзацы. Обрезает по max_chars
-    (по умолчанию — config.ARTICLE_MAX_CHARS). Если вместо статьи
-    загрузилась страница с ошибкой сервера (сайт-источник в моменте
-    отдал 200 OK с текстом вроде "Error 500... try again later") —
-    возвращает пустую строку, чтобы вызывающий код взял запасной текст
-    из RSS summary вместо этого мусора.
+    Если вместо статьи загрузилась страница с ошибкой сервера —
+    возвращает пустую строку, чтобы взять запасной текст из RSS summary.
     """
     if max_chars is None:
         max_chars = ARTICLE_MAX_CHARS
@@ -317,7 +370,6 @@ def extract_article_text(article_url: str, max_chars: int = None) -> str:
     container = soup.find("article") or soup
 
     paragraphs = [p.get_text(" ", strip=True) for p in container.find_all("p")]
-    # оставляем только содержательные абзацы — короткие строки обычно навигация/подписи
     meaningful = [p for p in paragraphs if len(p) > 40]
     text = " ".join(meaningful)
 
@@ -336,12 +388,9 @@ def translate_text(text: str) -> str:
     if not text or not TRANSLATE_TO:
         return text
     try:
-        # deep-translator режет длинные тексты по лимиту символов сам не всегда корректно,
-        # поэтому подстраховываемся ручным разбиением на предложения при необходимости.
         translator = GoogleTranslator(source="auto", target=TRANSLATE_TO)
         if len(text) <= 4500:
             return translator.translate(text)
-        # длинный текст — переводим по частям
         chunks = re.split(r"(?<=[.!?])\s+", text)
         translated_chunks = [translator.translate(chunk) for chunk in chunks if chunk.strip()]
         return " ".join(translated_chunks)
@@ -351,11 +400,7 @@ def translate_text(text: str) -> str:
 
 
 def pick_headline_icon(title: str) -> str:
-    """
-    Подбирает иконку под заголовок, приближаясь к стилю крупных
-    футбольных Telegram-каналов: цитаты/прямая речь — 🗣, срочные
-    новости/трансферы — 👀, обычные новости — 📰.
-    """
+    """Подбирает иконку под заголовок: цитаты — 🗣, трансферы — 👀, обычные новости — 📰."""
     lowered = title.lower()
     quote_markers = [" says", " on ", ":", "'", "\u2018", "\u2019"]
     transfer_markers = ["transfer", "sign", "deal", "move to", "join"]
@@ -397,8 +442,7 @@ def find_club_mention(text: str) -> str | None:
 def find_player_name(text: str) -> str | None:
     """
     Простая эвристика для имени футболиста: два подряд идущих слова с
-    заглавной буквы (типичный паттерн "Имя Фамилия" в англоязычном
-    заголовке) — исключая уже известные названия клубов и служебные
+    заглавной буквы — исключая уже известные названия клубов и служебные
     слова.
     """
     candidates = re.findall(r"\b[A-Z][a-zA-Z'\-]+ [A-Z][a-zA-Z'\-]+\b", text)
@@ -412,45 +456,38 @@ def find_player_name(text: str) -> str | None:
     return None
 
 
-def pick_image_search_query(title_en: str, body_en: str, fallback: str) -> str:
+def pick_image_search_query(title_en: str, body_en: str, fallback: str) -> tuple[str, str, str]:
     """
-    Шаг 2 и 3 алгоритма: разбирает текст новости (заголовок + начало
-    статьи, на английском — до перевода, так эвристика по заглавным
-    буквам работает надёжнее) и определяет, каких футболистов/клубы она
-    касается. Приоритет для поиска фото: конкретный игрок > клуб >
-    исходный заголовок как крайний случай, если ни то ни другое не нашлось.
+    Разбирает текст новости и определяет, каких футболистов/клубы она
+    касается. Возвращает (точный_запрос, запасной_запрос, имя_игрока):
+    - точный: "игрок клуб" > игрок > клуб > исходный заголовок
+    - запасной: клуб (если есть) > "football"
+    - имя_игрока: отдельно, для точного поиска портрета через Wikipedia
     """
     combined = f"{title_en} {body_en[:300]}"
 
     player = find_player_name(title_en) or find_player_name(combined)
     club = find_club_mention(combined)
 
+    broader = club or "football"
+
     if player and club:
-        return f"{player} {club}"
+        return f"{player} {club}", broader, player
     if player:
-        return player
+        return player, broader, player
     if club:
-        return club
-    return fallback
+        return club, broader, ""
+    return fallback, "football", ""
 
 
 def build_entry_content(entry, article_url: str, title: str):
     """
-    Шаг 1 алгоритма (чтение и анализ поста) + сборка текста и подбор
-    фото в один блокирующий проход — чтобы вызывающий код мог отдать его
-    целиком в отдельный поток через asyncio.to_thread и не блокировать
-    event loop бота на время сетевых запросов.
-
-    Порядок: читаем заголовок и текст статьи (на английском) -> из них
-    определяем игроков/клубы (pick_image_search_query) -> ищем фото
-    именно по ним, а не по общей теме -> уже потом переводим текст для
-    самого поста.
+    Читает и анализирует пост -> определяет игроков/клубы -> ищет фото
+    именно по ним (приоритет — точный портрет игрока через Wikipedia) ->
+    переводит текст для самого поста.
 
     Возвращает (None, None), если сама RSS-запись выглядит как сбой
-    сайта-источника (например, заголовок вида "Error 500... try again
-    later" — временная страница с ошибкой попала в ленту вместо реальной
-    новости). Вызывающий код в этом случае должен пропустить такую
-    запись, не создавая из неё черновик.
+    сайта-источника — вызывающий код должен пропустить такую запись.
     """
     title_en = entry.get("title", "").strip()
 
@@ -463,8 +500,8 @@ def build_entry_content(entry, article_url: str, title: str):
     full_text_en = extract_article_text(article_url) if article_url else ""
     body_en = full_text_en if len(full_text_en) > len(rss_summary_en) else rss_summary_en
 
-    search_query = pick_image_search_query(title_en, body_en, fallback=title_en)
-    image_url = get_image_for_entry(entry, article_url, search_query)
+    search_query, broader_query, person_name = pick_image_search_query(title_en, body_en, fallback=title_en)
+    image_url = get_image_for_entry(entry, article_url, search_query, broader_query, person_name)
 
     icon = pick_headline_icon(title_en)
     title_ru = translate_text(title_en)

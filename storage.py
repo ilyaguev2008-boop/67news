@@ -22,7 +22,7 @@ def init_db():
                 title TEXT,
                 text TEXT,
                 image_url TEXT,
-                status TEXT DEFAULT 'pending',   -- pending / approved / rejected
+                status TEXT DEFAULT 'pending',
                 published_channel_id TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -86,8 +86,6 @@ def create_draft(feed_name: str, source_link: str, title: str, text: str, image_
 
 
 def get_pending_draft_ids():
-    """Все черновики со статусом pending, старые сначала — то, что накопил
-    фоновый планировщик между твоими проверками, плюс всё найденное только что."""
     with closing(sqlite3.connect(DB_PATH)) as conn:
         cur = conn.execute(
             "SELECT draft_id FROM drafts WHERE status = 'pending' ORDER BY created_at"

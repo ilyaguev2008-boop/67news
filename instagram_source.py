@@ -12,9 +12,6 @@ logger = logging.getLogger(__name__)
 
 MEDIA_DIR = config.MEDIA_DIR
 
-# instaloader — не обязательная зависимость: если не установлена (или
-# Instagram-аккаунты не заданы), этот источник просто молча выключается,
-# не мешая остальным работать.
 try:
     import instaloader
     _INSTALOADER_AVAILABLE = True
@@ -36,7 +33,6 @@ def is_configured() -> bool:
 
 
 def _download_image(url: str, shortcode: str) -> str:
-    """Скачивает фото поста локально. Возвращает путь к файлу или '' при неудаче."""
     try:
         os.makedirs(MEDIA_DIR, exist_ok=True)
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -51,18 +47,7 @@ def _download_image(url: str, shortcode: str) -> str:
 
 
 def poll_instagram() -> list[str]:
-    """
-    СИНХРОННАЯ (блокирующая) функция — вызывать через asyncio.to_thread.
-
-    Забирает последние посты с аккаунтов из INSTAGRAM_ACCOUNTS_TO_MONITOR.
-
-    ВАЖНО: нестабильный источник. Instagram не даёт официального публичного
-    API для чтения чужих аккаунтов — instaloader эмулирует браузер, и в
-    любой момент Instagram может начать требовать логин, показать капчу
-    или заблокировать IP без предупреждения. Ошибка на одном аккаунте не
-    останавливает проверку остальных источников — просто логируется и
-    пропускается.
-    """
+    """СИНХРОННАЯ функция — вызывать через asyncio.to_thread. Нестабильный источник."""
     if not is_configured():
         return []
 
