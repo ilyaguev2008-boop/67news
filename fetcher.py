@@ -8,7 +8,7 @@ import requests
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
 
-from config import UNSPLASH_ACCESS_KEY, MAX_ENTRIES_PER_FEED, TRANSLATE_TO, LOOKBACK_HOURS, ARTICLE_MAX_CHARS, USE_SOURCE_IMAGES, FEEDS
+from config import UNSPLASH_ACCESS_KEY, MAX_ENTRIES_PER_FEED, TRANSLATE_TO, LOOKBACK_HOURS, ARTICLE_MAX_CHARS, USE_SOURCE_IMAGES, FEEDS, MEDIA_DIR, LOCAL_PLACEHOLDER_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -330,35 +330,146 @@ def search_image_with_broadening(specific_query: str, broader_query: str, person
     return search_fallback_image(broader_query or "football")
 
 
+def download_and_prepare_image(url: str) -> str | None:
+    """
+    Скачивает фото по ссылке, проверяет, что это реально изображение (а
+    не HTML-страница/редирект), и сохраняет локально в виде JPEG — так
+    Telegram получает уже проверенный и подготовленный файл, а не просто
+    ссылку, за которой сам может получить что-то неожиданное (WebP/AVIF
+    без поддержки, страницу с ошибкой, редирект, требование cookies и
+    т.п.). Возвращает локальный путь к файлу или None, если скачать/
+    обработать не удалось — тогда вызывающий код переходит к плейсхолдеру.
+    """
+    import os
+    import io
+    import hashlib
+
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=12)
+        resp.raise_for_status()
+        content_type = resp.headers.get("Content-Type", "")
+        if not content_type.startswith("image/"):
+            logger.warning(f"Ссылка на фото отдала не изображение ({content_type}): {url}")
+            return None
+
+        from PIL import Image
+        img = Image.open(io.BytesIO(resp.content))
+        img = img.convert("RGB")  # приводим WebP/PNG-с-альфаканалом/CMYK и т.п. к обычному RGB
+
+        os.makedirs(MEDIA_DIR, exist_ok=True)
+        filename = hashlib.md5(url.encode()).hexdigest()[:16] + ".jpg"
+        path = os.path.join(MEDIA_DIR, filename)
+        img.save(path, "JPEG", quality=85)
+        return path
+    except Exception as e:
+        logger.warning(f"Не удалось скачать/обработать фото {url}: {e}")
+        return None
+
+
 def get_image_for_entry(entry, article_url: str, search_query: str, broader_query: str = "", person_name: str = "") -> str:
     """
     По умолчанию НЕ берёт фото со страницы источника (og:image) и не
     берёт миниатюру из RSS — у крупных изданий эти фото почти всегда
     содержат их логотип/вотермарку. Вместо этого ищет нейтральное фото
     по теме в интернете, с приоритетом на точный портрет конкретного
-    футболиста (см. search_fallback_image). Если понадобится вернуть
-    старое поведение — см. config.USE_SOURCE_IMAGES.
+    футболиста (см. search_fallback_image). Найденную ссылку скачивает и
+    проверяет локально (download_and_prepare_image) — если это не
+    получилось, использует гарантированный локальный плейсхолдер. Если
+    понадобится вернуть старое поведение — см. config.USE_SOURCE_IMAGES.
     """
     if USE_SOURCE_IMAGES:
         image = extract_image_from_article(article_url)
         if image:
-            return image
+            local = download_and_prepare_image(image)
+            if local:
+                return local
         image = extract_image_from_rss_entry(entry)
         if image:
-            return image
+            local = download_and_prepare_image(image)
+            if local:
+                return local
 
-    return search_image_with_broadening(search_query, broader_query or search_query, person_name=person_name)
+    candidate_url = search_image_with_broadening(search_query, broader_query or search_query, person_name=person_name)
+
+    if candidate_url == PLACEHOLDER_IMAGE:
+        return LOCAL_PLACEHOLDER_PATH
+
+    local_path = download_and_prepare_image(candidate_url)
+    return local_path or LOCAL_PLACEHOLDER_PATH
 
 
-def extract_article_text(article_url: str, max_chars: int = None) -> str:
+# Фразы-маркеры "мусорных" абзацев — реклама, подписки, навигация,
+# related-статьи и т.п., которые попадаются даже внутри <article>
+_BOILERPLATE_MARKERS = [
+    "sign up", "subscribe", "newsletter", "follow us", "related:",
+    "read more:", "share this", "advertisement", "sponsored",
+    "all rights reserved", "cookie", "click here", "watch:",
+    "подпишись", "подписывайся", "реклама", "читайте также",
+    "подробнее:",
+]
+
+
+def _is_boilerplate_paragraph(text: str) -> bool:
+    """True для абзацев-мусора: реклама, подписки, навигация и т.п."""
+    lowered = text.lower()
+    return any(marker in lowered for marker in _BOILERPLATE_MARKERS)
+
+
+def _extract_with_readability(html: str) -> list[str] | None:
     """
-    Заходит на страницу статьи и собирает основной текст (абзацы <p>).
+    Пытается вычленить основной текст статьи через readability-lxml —
+    библиотеку, которая (в отличие от простого перебора всех <p>) умеет
+    отличать основной контент от меню/сайдбара/рекламы примерно так же,
+    как это делает "режим чтения" в браузере. Возвращает список абзацев
+    или None, если библиотека недоступна или не смогла ничего вычленить.
+    """
+    try:
+        from readability import Document
+    except ImportError:
+        return None
+
+    try:
+        doc = Document(html)
+        summary_html = doc.summary()
+    except Exception as e:
+        logger.warning(f"readability не смогла разобрать статью: {e}")
+        return None
+
+    soup = BeautifulSoup(summary_html, "html.parser")
+    paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+    paragraphs = [p for p in paragraphs if len(p) > 40 and not _is_boilerplate_paragraph(p)]
+    return paragraphs or None
+
+
+def _extract_with_fallback(html: str) -> list[str]:
+    """
+    Запасной вариант, если readability-lxml не установлена или не
+    справилась: ищем <article>, иначе всю страницу, берём все <p>,
+    отфильтровываем короткие/мусорные абзацы.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    container = soup.find("article") or soup
+
+    paragraphs = [p.get_text(" ", strip=True) for p in container.find_all("p")]
+    return [p for p in paragraphs if len(p) > 40 and not _is_boilerplate_paragraph(p)]
+
+
+def extract_article_text(article_url: str) -> str:
+    """
+    Заходит на страницу статьи и собирает основной текст, сохраняя
+    разбивку на абзацы (соединены \\n\\n, а не в одну сплошную строку).
+    Приоритет — readability-lxml (умное вычленение основного контента,
+    отличает статью от меню/рекламы/сайдбара); если недоступна или не
+    справилась — запасной способ (все <p> внутри <article>, с фильтром
+    явного мусора).
+
+    Больше НЕ обрезает текст по длине — полный текст сохраняется и
+    переводится целиком; финальная обрезка под лимит поста происходит
+    отдельно, непосредственно перед отправкой (см. bot.py:truncate_caption
+    и config.ARTICLE_MAX_CHARS, применяемый уже к переведённому тексту).
     Если вместо статьи загрузилась страница с ошибкой сервера —
     возвращает пустую строку, чтобы взять запасной текст из RSS summary.
     """
-    if max_chars is None:
-        max_chars = ARTICLE_MAX_CHARS
-
     try:
         resp = requests.get(article_url, headers=HEADERS, timeout=10)
         resp.raise_for_status()
@@ -366,34 +477,45 @@ def extract_article_text(article_url: str, max_chars: int = None) -> str:
         logger.warning(f"Не удалось загрузить текст статьи {article_url}: {e}")
         return ""
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    container = soup.find("article") or soup
+    paragraphs = _extract_with_readability(resp.text)
+    if not paragraphs:
+        paragraphs = _extract_with_fallback(resp.text)
 
-    paragraphs = [p.get_text(" ", strip=True) for p in container.find_all("p")]
-    meaningful = [p for p in paragraphs if len(p) > 40]
-    text = " ".join(meaningful)
+    text = "\n\n".join(paragraphs)
 
     if _looks_like_error_page(text):
         logger.warning(f"Похоже на страницу с ошибкой вместо статьи ({article_url}), беру RSS summary")
         return ""
 
-    if len(text) > max_chars:
-        text = text[:max_chars].rsplit(" ", 1)[0] + "…"
-
     return text
 
 
+def _translate_single(text: str, translator) -> str:
+    """Переводит один кусок текста (< 4500 симв. — лимит Google Translate за раз), с разбивкой по предложениям при необходимости."""
+    if len(text) <= 4500:
+        return translator.translate(text)
+    chunks = re.split(r"(?<=[.!?])\s+", text)
+    translated_chunks = [translator.translate(chunk) for chunk in chunks if chunk.strip()]
+    return " ".join(translated_chunks)
+
+
 def translate_text(text: str) -> str:
-    """Переводит текст на язык из config.TRANSLATE_TO. Если перевод не удался — возвращает оригинал."""
+    """
+    Переводит текст на язык из config.TRANSLATE_TO, сохраняя разбивку на
+    абзацы (текст с \\n\\n переводится по абзацам, а не одним сплошным
+    куском — так итоговое форматирование не "слипается"). Если перевод
+    не удался — возвращает оригинал.
+    """
     if not text or not TRANSLATE_TO:
         return text
     try:
         translator = GoogleTranslator(source="auto", target=TRANSLATE_TO)
-        if len(text) <= 4500:
-            return translator.translate(text)
-        chunks = re.split(r"(?<=[.!?])\s+", text)
-        translated_chunks = [translator.translate(chunk) for chunk in chunks if chunk.strip()]
-        return " ".join(translated_chunks)
+        if "\n\n" not in text:
+            return _translate_single(text, translator)
+
+        paragraphs = text.split("\n\n")
+        translated_paragraphs = [_translate_single(p, translator) for p in paragraphs if p.strip()]
+        return "\n\n".join(translated_paragraphs)
     except Exception as e:
         logger.warning(f"Не удалось перевести текст: {e}")
         return text
@@ -480,11 +602,39 @@ def pick_image_search_query(title_en: str, body_en: str, fallback: str) -> tuple
     return fallback, "football", ""
 
 
+def _truncate_paragraphs(text: str, max_chars: int) -> str:
+    """
+    Обрезает текст под лимит длины, стараясь резать по границе абзаца, а
+    не посреди слова/предложения — так итоговый пост выглядит аккуратнее.
+    Если даже первый абзац длиннее лимита — обрезает его по словам.
+    """
+    if len(text) <= max_chars:
+        return text
+
+    paragraphs = text.split("\n\n")
+    result = []
+    used = 0
+    for p in paragraphs:
+        # +2 за "\n\n", которые добавятся при склейке
+        if used + len(p) + 2 > max_chars:
+            break
+        result.append(p)
+        used += len(p) + 2
+
+    if result:
+        return "\n\n".join(result) + "…"
+
+    # даже один абзац не влезает целиком — обрезаем по словам
+    return text[:max_chars].rsplit(" ", 1)[0] + "…"
+
+
 def build_entry_content(entry, article_url: str, title: str):
     """
     Читает и анализирует пост -> определяет игроков/клубы -> ищет фото
     именно по ним (приоритет — точный портрет игрока через Wikipedia) ->
-    переводит текст для самого поста.
+    переводит текст для самого поста -> обрезает под лимит длины поста
+    уже ПОСЛЕ перевода (config.ARTICLE_MAX_CHARS), чтобы не терять
+    информацию на середине обработки.
 
     Возвращает (None, None), если сама RSS-запись выглядит как сбой
     сайта-источника — вызывающий код должен пропустить такую запись.
@@ -506,7 +656,15 @@ def build_entry_content(entry, article_url: str, title: str):
     icon = pick_headline_icon(title_en)
     title_ru = translate_text(title_en)
     body_ru = translate_text(body_en)
+    body_ru = _truncate_paragraphs(body_ru, ARTICLE_MAX_CHARS)
 
-    text = f"{icon} {title_ru}\n\n«{body_ru}»" if body_ru else f"{icon} {title_ru}"
+    if not body_ru:
+        text = f"{icon} {title_ru}"
+    elif icon == "🗣":
+        # цитатный пост — оформляем как прямую речь, в кавычках-ёлочках
+        text = f"{icon} {title_ru}\n\n«{body_ru}»"
+    else:
+        # обычная новость — нормальными абзацами, без кавычек вокруг всего текста
+        text = f"{icon} {title_ru}\n\n{body_ru}"
 
     return text, image_url

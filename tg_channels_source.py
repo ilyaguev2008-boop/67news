@@ -3,7 +3,7 @@ import os
 
 import config
 import storage
-from fetcher import translate_text, PLACEHOLDER_IMAGE
+from fetcher import translate_text
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ async def _handle_new_message(event):
             source_link=source_link,
             title=channel_title,
             text=f"📢 {translated}",
-            image_url=image_path or PLACEHOLDER_IMAGE,
+            image_url=image_path or config.LOCAL_PLACEHOLDER_PATH,
         )
         storage.mark_entry_seen(eid, "telegram-channel")
         logger.info(f"[TG-канал: {channel_title}] новый пост -> черновик {draft_id}")

@@ -7,3 +7,5 @@ python-dotenv==1.0.1
 deep-translator==1.11.4
 telethon==1.36.0
 instaloader==4.13.1
+Pillow==10.4.0
+readability-lxml==0.8.1

@@ -6,7 +6,7 @@ import requests
 
 import config
 import storage
-from fetcher import translate_text, HEADERS, PLACEHOLDER_IMAGE
+from fetcher import translate_text, HEADERS
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +84,7 @@ def poll_instagram() -> list[str]:
                     source_link=f"https://www.instagram.com/p/{post.shortcode}/",
                     title=f"Instagram — @{username}",
                     text=f"📸 {translated}" if translated else f"📸 Новый пост @{username}",
-                    image_url=image_path or PLACEHOLDER_IMAGE,
+                    image_url=image_path or config.LOCAL_PLACEHOLDER_PATH,
                 )
                 storage.mark_entry_seen(eid, "instagram")
                 new_draft_ids.append(draft_id)
