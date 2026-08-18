@@ -1,6 +1,8 @@
 import asyncio
 import logging
 
+from aiogram.types import URLInputFile
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -105,14 +107,37 @@ def truncate_caption(text: str, suffix: str = "") -> str:
     return trimmed + suffix
 
 
+
+CAPTION_LIMIT = getattr(config, "TELEGRAM_CAPTION_LIMIT", 1000)
+
+
+def split_long_text(text: str, limit: int = CAPTION_LIMIT):
+    if len(text) <= limit:
+        return text, ""
+
+    first = text[:limit]
+    cut = max(
+        first.rfind("\n\n"),
+        first.rfind("\n"),
+        first.rfind(". "),
+        first.rfind("! "),
+        first.rfind("? "),
+        first.rfind(" "),
+    )
+    if cut < int(limit * 0.60):
+        cut = limit
+
+    return first[:cut].rstrip(), text[cut:].lstrip()
+
+
 def photo_input(image_url: str):
-    if image_url.startswith("http://") or image_url.startswith("https://"):
-        return image_url
+    if image_url.startswith(("http://", "https://")):
+        return URLInputFile(image_url)
     return FSInputFile(image_url)
 
 
 async def send_draft_to_admin(draft: dict):
-    caption = truncate_caption(draft["text"])
+    caption, rest = split_long_text(draft["text"])
     kb = moderation_keyboard(draft["draft_id"], draft.get("source_link"))
 
     try:
@@ -122,16 +147,32 @@ async def send_draft_to_admin(draft: dict):
             caption=caption,
             reply_markup=kb,
         )
-        return
+        if rest:
+            await bot.send_message(
+                config.ADMIN_ID,
+                f"📄 Продолжение:\n\n{rest}",
+            )
     except Exception as e:
-        logger.warning(f"Не удалось отправить фото черновика {draft['draft_id']} ({e}), пробую локальный плейсхолдер")
-
-    await bot.send_photo(
-        chat_id=config.ADMIN_ID,
-        photo=FSInputFile(config.LOCAL_PLACEHOLDER_PATH),
-        caption=caption,
-        reply_markup=kb,
-    )
+        logger.warning(f"Не удалось отправить фото черновика: {e}")
+        try:
+            await bot.send_photo(
+                chat_id=config.ADMIN_ID,
+                photo=FSInputFile(config.LOCAL_PLACEHOLDER_PATH),
+                caption=caption,
+                reply_markup=kb,
+            )
+            if rest:
+                await bot.send_message(
+                    config.ADMIN_ID,
+                    f"📄 Продолжение:\n\n{rest}",
+                )
+        except Exception as e2:
+            logger.error(f"Не удалось отправить даже placeholder: {e2}")
+            await bot.send_message(
+                config.ADMIN_ID,
+                draft["text"],
+                reply_markup=kb,
+            )
 
 
 async def send_next_in_queue(admin_id: int):
@@ -339,7 +380,7 @@ async def publish_draft(callback: CallbackQuery, draft_id: str, channel_id: str)
         await callback.answer("Черновик уже обработан или не найден.", show_alert=True)
         return
 
-    caption = truncate_caption(draft["text"])
+    caption, rest = split_long_text(draft["text"])
     source_kb = source_only_keyboard(draft.get("source_link"))
 
     try:
@@ -349,6 +390,8 @@ async def publish_draft(callback: CallbackQuery, draft_id: str, channel_id: str)
             caption=caption,
             reply_markup=source_kb,
         )
+        if rest:
+            await bot.send_message(chat_id=channel_id, text=rest)
     except Exception as e:
         logger.warning(f"Не удалось опубликовать фото в канал {channel_id} ({e}), пробую локальный плейсхолдер")
         try:
@@ -358,6 +401,8 @@ async def publish_draft(callback: CallbackQuery, draft_id: str, channel_id: str)
                 caption=caption,
                 reply_markup=source_kb,
             )
+            if rest:
+                await bot.send_message(chat_id=channel_id, text=rest)
         except Exception as e2:
             logger.error(f"Ошибка публикации в канал {channel_id}: {e2}")
             await callback.answer(f"Ошибка публикации: {e2}", show_alert=True)
@@ -431,7 +476,7 @@ async def handle_new_text(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    storage.update_draft_text(draft_id, message.text)
+    storage.update_draft_text(draft_id, (message.text or message.caption or "").strip())
     await state.clear()
 
     updated = storage.get_draft(draft_id)

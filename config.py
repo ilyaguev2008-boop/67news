@@ -51,13 +51,13 @@ FEEDS = [
 
 # Максимальная длина текста статьи, который бот берёт со страницы
 # источника (в символах, до перевода).
-ARTICLE_MAX_CHARS = 380
+ARTICLE_MAX_CHARS = 6000
 
 # Если False (по умолчанию) — бот НЕ берёт фото со страницы источника
 # (og:image) и не берёт миниатюру из RSS-записи — у крупных изданий эти
 # фото почти всегда содержат их логотип/вотермарку. Вместо этого ищет
 # нейтральное фото по теме в интернете.
-USE_SOURCE_IMAGES = False
+USE_SOURCE_IMAGES = True
 
 # Как часто проверять ленты на новые новости (в минутах)
 POLL_INTERVAL_MINUTES = 5
@@ -92,3 +92,7 @@ TELEGRAM_CHANNELS_TO_MONITOR = [
 INSTAGRAM_ACCOUNTS_TO_MONITOR = [
     # "some_instagram_username",
 ]
+
+DOWNLOAD_IMAGES_LOCALLY = True
+
+TELEGRAM_CAPTION_LIMIT = 1000

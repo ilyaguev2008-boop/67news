@@ -1,64 +1,68 @@
+import hashlib
+import json
+import logging
+import os
 import re
 import time
-import logging
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urljoin, urlparse
 
 import feedparser
 import requests
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
 
-from config import UNSPLASH_ACCESS_KEY, MAX_ENTRIES_PER_FEED, TRANSLATE_TO, LOOKBACK_HOURS, ARTICLE_MAX_CHARS, USE_SOURCE_IMAGES, FEEDS, MEDIA_DIR, LOCAL_PLACEHOLDER_PATH
+from config import (
+    UNSPLASH_ACCESS_KEY,
+    MAX_ENTRIES_PER_FEED,
+    TRANSLATE_TO,
+    LOOKBACK_HOURS,
+    ARTICLE_MAX_CHARS,
+    USE_SOURCE_IMAGES,
+    DOWNLOAD_IMAGES_LOCALLY,
+    MEDIA_DIR,
+    FEEDS,
+)
 
 logger = logging.getLogger(__name__)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; FootballNewsBot/1.0; +https://example.com/bot)"
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/139.0 Safari/537.36 FootballNewsBot/2.0"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
-PLACEHOLDER_IMAGE = "https://images.unsplash.com/photo-1508098682722-e99c43a406b2"  # общее фото футбольного мяча
+PLACEHOLDER_IMAGE = "https://images.unsplash.com/photo-1508098682722-e99c43a406b2"
 
-
-def is_valid_image_url(url: str) -> bool:
-    """
-    Проверяет, что ссылка реально отдаёт изображение (Content-Type
-    начинается с 'image/'), а не HTML-страницу, SVG или что-то ещё,
-    что Telegram откажется принять как фото ('wrong type of the web
-    page content').
-    """
-    try:
-        resp = requests.head(url, headers=HEADERS, timeout=8, allow_redirects=True)
-        content_type = resp.headers.get("Content-Type", "")
-        if content_type.startswith("image/") and "svg" not in content_type:
-            return True
-    except requests.RequestException:
-        pass
-    return False
-
-
-def clean_html(raw_html: str) -> str:
-    """Убирает HTML-теги из текста RSS summary."""
-    if not raw_html:
-        return ""
-    text = BeautifulSoup(raw_html, "html.parser").get_text(separator=" ")
-    return re.sub(r"\s+", " ", text).strip()
-
+_BAD_IMAGE_MARKERS = (
+    "logo", "wordmark", "masthead", "icon", "sprite", "avatar",
+    "placeholder", "screenshot", "frontpage", "front-page", "newspaper",
+    "headline", "cover", "magazine", "advert", "banner", "captcha",
+    "diagram", "map", "coat-of-arms", "crest", "emblem", "flag",
+)
+_BAD_TEXT_MARKERS = (
+    "subscribe to", "sign up to our newsletter", "privacy policy",
+    "cookie policy", "follow us on", "read more:", "advertisement",
+)
+_REMOVE_SELECTORS = (
+    "script", "style", "noscript", "svg", "form", "nav", "footer",
+    "header", "aside", "iframe", "dialog", "template",
+    ".advert", ".advertisement", ".ads", ".ad", ".cookie", ".consent",
+    ".newsletter", ".related", ".recommended", ".comments", ".comment",
+    ".social", ".share", ".sharing", ".breadcrumb", ".navigation",
+    ".menu", ".sidebar", ".footer", ".promo", ".sponsor",
+)
 
 def _entry_published_dt(entry):
-    """Возвращает datetime публикации записи (UTC), если он есть в RSS."""
     struct_time = entry.get("published_parsed") or entry.get("updated_parsed")
     if not struct_time:
         return None
     return datetime.fromtimestamp(time.mktime(struct_time), tz=timezone.utc)
 
-
 def fetch_feed_entries(feed_url: str):
-    """
-    Возвращает записи RSS-ленты за последние LOOKBACK_HOURS часов.
-    Лента скачивается через requests (а не напрямую через
-    feedparser.parse(url)) — обходит ошибку SSL: CERTIFICATE_VERIFY_FAILED,
-    характерную для Python на macOS.
-    """
     try:
         response = requests.get(feed_url, headers=HEADERS, timeout=15)
         response.raise_for_status()
@@ -71,122 +75,284 @@ def fetch_feed_entries(feed_url: str):
         logger.warning(f"Не удалось разобрать ленту {feed_url}: {parsed.bozo_exception}")
         return []
 
-    all_entries = parsed.entries
-    logger.info(f"{feed_url}: в ленте всего {len(all_entries)} записей")
-
+    entries = parsed.entries
     if LOOKBACK_HOURS:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
-        recent = []
-        for entry in all_entries:
-            pub_dt = _entry_published_dt(entry)
-            if pub_dt is None or pub_dt >= cutoff:
-                recent.append(entry)
-        logger.info(f"{feed_url}: из них за последние {LOOKBACK_HOURS} ч. — {len(recent)}")
-        all_entries = recent
-
-    return all_entries[:MAX_ENTRIES_PER_FEED]
-
+        entries = [
+            entry for entry in entries
+            if _entry_published_dt(entry) is None or _entry_published_dt(entry) >= cutoff
+        ]
+    return entries[:MAX_ENTRIES_PER_FEED]
 
 def entry_unique_id(entry) -> str:
     return entry.get("id") or entry.get("guid") or entry.get("link")
 
+def clean_html(raw_html: str) -> str:
+    if not raw_html:
+        return ""
+    text = BeautifulSoup(raw_html, "html.parser").get_text(" ", strip=True)
+    return re.sub(r"\s+", " ", text).strip()
 
-def extract_image_from_rss_entry(entry) -> str | None:
-    """Пытается достать картинку прямо из RSS-записи (enclosure/media)."""
-    if "media_content" in entry and entry.media_content:
-        url = entry.media_content[0].get("url")
-        if url:
+def extract_image_from_rss_entry(entry):
+    for field in ("media_content", "media_thumbnail"):
+        for item in entry.get(field, []) or []:
+            url = item.get("url")
+            if url:
+                return url
+
+    for link in entry.get("links", []) or []:
+        if link.get("type", "").startswith("image/") and link.get("href"):
+            return link["href"]
+
+    for item in entry.get("enclosures", []) or []:
+        url = item.get("href") or item.get("url")
+        if url and item.get("type", "").startswith("image/"):
             return url
-    if "media_thumbnail" in entry and entry.media_thumbnail:
-        url = entry.media_thumbnail[0].get("url")
-        if url:
-            return url
-    for link in entry.get("links", []):
-        if link.get("type", "").startswith("image/"):
-            return link.get("href")
     return None
 
+def _normalise_url(url, base_url):
+    if not url:
+        return None
+    url = url.strip()
+    if url.startswith("//"):
+        return "https:" + url
+    return urljoin(base_url, url)
 
-def extract_image_from_article(article_url: str) -> str | None:
-    """Заходит на страницу статьи и ищет og:image / twitter:image / первую крупную картинку."""
+def _image_is_bad(url, alt="", title=""):
+    value = f"{url} {alt} {title}".lower()
+    return any(marker in value for marker in _BAD_IMAGE_MARKERS)
+
+def _valid_image_url(url):
+    if not url or not url.startswith(("http://", "https://")):
+        return False
     try:
-        resp = requests.get(article_url, headers=HEADERS, timeout=10)
-        resp.raise_for_status()
+        response = requests.get(
+            url, headers=HEADERS, timeout=10, stream=True, allow_redirects=True
+        )
+        content_type = response.headers.get("Content-Type", "").lower()
+        response.close()
+        return content_type.startswith("image/") and "svg" not in content_type
+    except requests.RequestException:
+        return False
+
+def _jsonld_objects(soup):
+    for script in soup.find_all("script", type="application/ld+json"):
+        raw = script.string or script.get_text()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        objects = data if isinstance(data, list) else [data]
+        for obj in objects:
+            if isinstance(obj, dict) and isinstance(obj.get("@graph"), list):
+                yield from obj["@graph"]
+            else:
+                yield obj
+
+def _extract_jsonld_article(soup):
+    best = ""
+    for obj in _jsonld_objects(soup):
+        if not isinstance(obj, dict):
+            continue
+        types = obj.get("@type", [])
+        types = types if isinstance(types, list) else [types]
+        if not any(str(t).lower() in {"article", "newsarticle", "reportage"} for t in types):
+            continue
+        body = obj.get("articleBody")
+        if isinstance(body, str) and len(body.strip()) > len(best):
+            best = body.strip()
+    return best
+
+def _clean_article_soup(soup):
+    for selector in _REMOVE_SELECTORS:
+        for node in soup.select(selector):
+            node.decompose()
+
+def _container_score(node):
+    paragraphs = [
+        p.get_text(" ", strip=True)
+        for p in node.find_all("p")
+    ]
+    useful = [p for p in paragraphs if len(p) >= 35]
+    text_len = sum(len(p) for p in useful)
+    identity = (
+        f"{node.name} {node.get('id', '')} "
+        f"{' '.join(node.get('class', []))}"
+    ).lower()
+
+    score = text_len + len(useful) * 180
+    if any(x in identity for x in ("article", "story", "content", "body", "main")):
+        score += 900
+    if any(x in identity for x in ("sidebar", "related", "comment", "footer", "nav", "advert")):
+        score -= 1800
+    return score, text_len
+
+def _paragraph_text(container):
+    result = []
+    seen = set()
+
+    for p in container.find_all("p"):
+        text = re.sub(r"\s+", " ", p.get_text(" ", strip=True)).strip()
+        if len(text) < 35:
+            continue
+
+        key = re.sub(r"\W+", "", text.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+
+        lowered = text.lower()
+        if any(marker in lowered for marker in _BAD_TEXT_MARKERS):
+            continue
+
+        result.append(text)
+
+    return "\n\n".join(result)
+
+def _trim_text(text, max_chars):
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text) <= max_chars:
+        return text
+
+    cut = text[:max_chars]
+    sentence = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+    if sentence >= int(max_chars * 0.65):
+        return cut[:sentence + 1].strip()
+    return cut.rsplit(" ", 1)[0].rstrip(" ,;:") + "…"
+
+def extract_article_text(article_url: str, max_chars=None):
+    if not article_url:
+        return ""
+    max_chars = max_chars or ARTICLE_MAX_CHARS
+
+    try:
+        response = requests.get(article_url, headers=HEADERS, timeout=15)
+        response.raise_for_status()
     except requests.RequestException as e:
-        logger.warning(f"Не удалось загрузить страницу {article_url}: {e}")
+        logger.warning(f"Не удалось загрузить статью {article_url}: {e}")
+        return ""
+
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    # First choice: structured articleBody.
+    structured = _extract_jsonld_article(soup)
+    if structured:
+        return _trim_text(structured, max_chars)
+
+    # Second choice: semantic article containers.
+    _clean_article_soup(soup)
+    candidates = []
+    for selector in (
+        "article",
+        "[itemprop='articleBody']",
+        "[class*='article-body']",
+        "[class*='articleBody']",
+        "[class*='article-content']",
+        "[class*='story-body']",
+        "[class*='story-content']",
+        "main",
+    ):
+        for node in soup.select(selector):
+            score, length = _container_score(node)
+            if length:
+                candidates.append((score, node))
+
+    # Last HTML fallback: largest meaningful div/section.
+    if not candidates:
+        for node in soup.find_all(["div", "section"]):
+            score, length = _container_score(node)
+            if length >= 200:
+                candidates.append((score, node))
+
+    if candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        text = _paragraph_text(candidates[0][1])
+        if text:
+            return _trim_text(text, max_chars)
+
+    return ""
+
+def extract_image_from_article(article_url: str):
+    if not article_url:
         return None
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    try:
+        response = requests.get(article_url, headers=HEADERS, timeout=15)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        logger.warning(f"Не удалось открыть страницу для поиска фото: {e}")
+        return None
 
-    og_image = soup.find("meta", property="og:image")
-    if og_image and og_image.get("content"):
-        return og_image["content"]
+    soup = BeautifulSoup(response.text, "html.parser")
 
-    twitter_image = soup.find("meta", attrs={"name": "twitter:image"})
-    if twitter_image and twitter_image.get("content"):
-        return twitter_image["content"]
+    # 1. OpenGraph/Twitter.
+    for attrs in (
+        {"property": "og:image"},
+        {"property": "og:image:url"},
+        {"name": "twitter:image"},
+        {"name": "twitter:image:src"},
+    ):
+        node = soup.find("meta", attrs=attrs)
+        if node and node.get("content"):
+            url = _normalise_url(node["content"], article_url)
+            if url and not _image_is_bad(url) and _valid_image_url(url):
+                return url
 
+    # 2. JSON-LD image.
+    for obj in _jsonld_objects(soup):
+        if not isinstance(obj, dict):
+            continue
+        image = obj.get("image")
+        values = image if isinstance(image, list) else [image]
+        for item in values:
+            url = item.get("url") if isinstance(item, dict) else item
+            url = _normalise_url(url, article_url)
+            if url and not _image_is_bad(url) and _valid_image_url(url):
+                return url
+
+    # 3. Large article images.
+    candidates = []
     for img in soup.find_all("img"):
-        src = img.get("src") or img.get("data-src")
-        if src and src.startswith("http"):
-            return src
+        src = (
+            img.get("src")
+            or img.get("data-src")
+            or img.get("data-lazy-src")
+            or img.get("data-original")
+        )
+        srcset = img.get("srcset") or img.get("data-srcset")
+        if srcset:
+            src = srcset.split(",")[-1].strip().split(" ")[0]
 
+        url = _normalise_url(src, article_url)
+        if not url or _image_is_bad(url, img.get("alt", ""), img.get("title", "")):
+            continue
+
+        try:
+            width = int(img.get("width", 0) or 0)
+            height = int(img.get("height", 0) or 0)
+        except ValueError:
+            width = height = 0
+
+        score = width * height
+        if img.parent and img.parent.name in {"figure", "picture"}:
+            score += 500000
+        candidates.append((score, url))
+
+    candidates.sort(reverse=True)
+    for _, url in candidates[:15]:
+        if _valid_image_url(url):
+            return url
     return None
 
-
-# Признаки в названии файла, по которым отсеиваем вероятные скриншоты
-# статей, газетные вырезки, обложки изданий, иконки/значки — то, где
-# почти наверняка будет чужой заголовок/логотип, а не нейтральное фото.
-_UNWANTED_FILENAME_MARKERS = [
-    "newspaper", "headline", "front page", "frontpage", "cover",
-    "magazine", "article", "clipping", "press", "screenshot",
-    "logo", "wordmark", "masthead", "газет", "заголов", "обложк",
-    "icon", "loudspeaker", "speaker icon", "audio", "pronunciation",
-    "symbol", "diagram", "flag of", "coat of arms", "crest", "emblem",
-    "map of", "wikimedia", "commons-logo", "question mark", "no image",
-    "placeholder",
-]
-
-# Расширения файлов, которые почти никогда не бывают настоящей фотографией
-# на Wikimedia Commons (значки, схемы, звук, видео).
-_NON_PHOTO_EXTENSIONS = (".svg", ".gif", ".ogg", ".ogv", ".webm", ".ico")
-
-
-def _looks_like_editorial_content(title: str) -> bool:
-    """True, если название файла намекает на газетную вырезку/скриншот/обложку/иконку."""
-    lowered = title.lower()
-    return any(marker in lowered for marker in _UNWANTED_FILENAME_MARKERS)
-
-
-# Признаки того, что вместо реальной статьи загрузилась страница с
-# ошибкой сервера/капчей/заглушкой.
-_ERROR_PAGE_MARKERS = [
-    "error 500", "server error", "please try again later",
-    "that's all we know", "access denied", "403 forbidden",
-    "404 not found", "page not found", "captcha",
-]
-
-
-def _looks_like_error_page(text: str) -> bool:
-    """True, если извлечённый текст похож на страницу с ошибкой, а не на статью."""
-    lowered = text.lower()
-    return len(text) < 600 and any(marker in lowered for marker in _ERROR_PAGE_MARKERS)
-
-
-def search_wikipedia_person_photo(name: str) -> str | None:
-    """
-    Самый точный источник для КОНКРЕТНОГО человека: запрашивает у Wikipedia
-    статью по имени и забирает её "pageimage" — фото из карточки статьи.
-    У футболистов (даже не самых известных — уровня второго/третьего
-    эшелона), если у них вообще есть статья в Wikipedia, почти всегда
-    есть и фото в карточке. Это гораздо точнее, чем полнотекстовый поиск
-    по файлам на Wikimedia Commons, который выше по шансам возвращает
-    нерелевантный результат.
-    """
+def search_wikipedia_person_photo(name):
     if not name:
         return None
     try:
-        resp = requests.get(
+        response = requests.get(
             "https://en.wikipedia.org/w/api.php",
             params={
                 "action": "query",
@@ -200,40 +366,28 @@ def search_wikipedia_person_photo(name: str) -> str | None:
             headers=HEADERS,
             timeout=10,
         )
-        resp.raise_for_status()
-        pages = resp.json().get("query", {}).get("pages", {})
+        response.raise_for_status()
+        pages = response.json().get("query", {}).get("pages", {})
         for page in pages.values():
-            if "missing" in page:
-                continue
-            thumbnail = page.get("thumbnail")
-            if not thumbnail:
-                continue
-            url = thumbnail.get("source")
-            if not url or not url.lower().endswith((".jpg", ".jpeg", ".png")):
-                continue
-            if is_valid_image_url(url):
-                return url
+            thumb = page.get("thumbnail")
+            if thumb and _valid_image_url(thumb.get("source")):
+                return thumb["source"]
     except requests.RequestException as e:
-        logger.warning(f"Wikipedia pageimage-поиск не сработал ({name!r}): {e}")
+        logger.warning(f"Wikipedia photo search failed: {e}")
     return None
 
-
-def search_wikimedia_image(query: str) -> str | None:
-    """
-    Полнотекстовый поиск по файлам Wikimedia Commons — запасной вариант,
-    когда прямой поиск статьи в Wikipedia (search_wikipedia_person_photo)
-    не сработал (например, запрос — не имя конкретного человека, а
-    название клуба или тема новости).
-    """
+def search_wikimedia_image(query):
+    if not query:
+        return None
     try:
-        resp = requests.get(
+        response = requests.get(
             "https://commons.wikimedia.org/w/api.php",
             params={
                 "action": "query",
                 "generator": "search",
-                "gsrsearch": f"{query} football",
-                "gsrnamespace": 6,  # namespace 6 = файлы
-                "gsrlimit": 8,
+                "gsrsearch": query,
+                "gsrnamespace": 6,
+                "gsrlimit": 10,
                 "prop": "imageinfo",
                 "iiprop": "url",
                 "iiurlwidth": 1200,
@@ -242,62 +396,42 @@ def search_wikimedia_image(query: str) -> str | None:
             headers=HEADERS,
             timeout=10,
         )
-        resp.raise_for_status()
-        pages = resp.json().get("query", {}).get("pages", {})
+        response.raise_for_status()
+        pages = response.json().get("query", {}).get("pages", {})
         for page in pages.values():
-            page_title = page.get("title", "")
-
-            if _looks_like_editorial_content(page_title):
+            title = page.get("title", "").lower()
+            if any(x in title for x in _BAD_IMAGE_MARKERS):
                 continue
-            if page_title.lower().endswith(_NON_PHOTO_EXTENSIONS):
+            info = page.get("imageinfo") or []
+            if not info:
                 continue
-
-            imageinfo = page.get("imageinfo")
-            if not imageinfo:
-                continue
-            url = imageinfo[0].get("thumburl") or imageinfo[0].get("url")
-            if not url or not url.lower().endswith((".jpg", ".jpeg", ".png")):
-                continue
-            if is_valid_image_url(url):
+            url = info[0].get("thumburl") or info[0].get("url")
+            if _valid_image_url(url):
                 return url
     except requests.RequestException as e:
-        logger.warning(f"Wikimedia-поиск не сработал: {e}")
+        logger.warning(f"Wikimedia photo search failed: {e}")
     return None
 
-
-def search_unsplash_image(query: str) -> str | None:
-    """Поиск через Unsplash — требует API-ключ (config.UNSPLASH_ACCESS_KEY)."""
-    if not UNSPLASH_ACCESS_KEY:
+def search_unsplash_image(query):
+    if not UNSPLASH_ACCESS_KEY or not query:
         return None
     try:
-        resp = requests.get(
+        response = requests.get(
             "https://api.unsplash.com/search/photos",
             params={"query": query, "per_page": 5, "orientation": "landscape"},
             headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"},
             timeout=10,
         )
-        resp.raise_for_status()
-        for photo in resp.json().get("results", []):
-            description = f"{photo.get('description') or ''} {photo.get('alt_description') or ''}"
-            if _looks_like_editorial_content(description):
-                continue
-            url = photo["urls"]["regular"]
-            if is_valid_image_url(url):
+        response.raise_for_status()
+        for photo in response.json().get("results", []):
+            url = photo.get("urls", {}).get("regular")
+            if url and _valid_image_url(url):
                 return url
     except requests.RequestException as e:
-        logger.warning(f"Unsplash fallback не сработал: {e}")
+        logger.warning(f"Unsplash search failed: {e}")
     return None
 
-
-def search_fallback_image(query: str, person_name: str = "") -> str:
-    """
-    Ищет фото по теме в интернете. Если известно конкретное имя
-    футболиста (person_name) — сначала пробует точный портрет через
-    Wikipedia pageimage (самый релевантный источник для человека), потом
-    общий поиск по Wikimedia Commons, и в конце Unsplash (если задан
-    ключ). Возвращает общий плейсхолдер, только если вообще ничего не
-    нашлось.
-    """
+def search_fallback_image(query, person_name=""):
     if person_name:
         image = search_wikipedia_person_photo(person_name)
         if image:
@@ -313,358 +447,140 @@ def search_fallback_image(query: str, person_name: str = "") -> str:
 
     return PLACEHOLDER_IMAGE
 
+def _download_image(url, label="news"):
+    if not url or not DOWNLOAD_IMAGES_LOCALLY:
+        return None
 
-def search_image_with_broadening(specific_query: str, broader_query: str, person_name: str = "") -> str:
-    """
-    Малоизвестные игроки/клубы часто не находятся по точному запросу —
-    пробуем сузить поиск постепенно: сначала точный запрос (с приоритетом
-    на точный портрет игрока, если есть имя), затем более общий запрос
-    (обычно клуб или "football"), и только если совсем ничего не нашлось
-    — общий плейсхолдер.
-    """
-    if specific_query and specific_query != broader_query:
-        image = search_fallback_image(specific_query, person_name=person_name)
-        if image != PLACEHOLDER_IMAGE:
-            return image
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:20]
+    ext = os.path.splitext(urlparse(url).path)[1].lower()
+    if ext not in (".jpg", ".jpeg", ".png", ".webp"):
+        ext = ".jpg"
 
-    return search_fallback_image(broader_query or "football")
-
-
-def download_and_prepare_image(url: str) -> str | None:
-    """
-    Скачивает фото по ссылке, проверяет, что это реально изображение (а
-    не HTML-страница/редирект), и сохраняет локально в виде JPEG — так
-    Telegram получает уже проверенный и подготовленный файл, а не просто
-    ссылку, за которой сам может получить что-то неожиданное (WebP/AVIF
-    без поддержки, страницу с ошибкой, редирект, требование cookies и
-    т.п.). Возвращает локальный путь к файлу или None, если скачать/
-    обработать не удалось — тогда вызывающий код переходит к плейсхолдеру.
-    """
-    import os
-    import io
-    import hashlib
+    path = os.path.join(MEDIA_DIR, f"news_{digest}{ext}")
+    if os.path.exists(path) and os.path.getsize(path) > 10000:
+        return path
 
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=12)
-        resp.raise_for_status()
-        content_type = resp.headers.get("Content-Type", "")
-        if not content_type.startswith("image/"):
-            logger.warning(f"Ссылка на фото отдала не изображение ({content_type}): {url}")
+        response = requests.get(
+            url, headers=HEADERS, timeout=20, allow_redirects=True
+        )
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").lower()
+        if not content_type.startswith("image/") or "svg" in content_type:
+            return None
+        if len(response.content) < 10000:
             return None
 
-        from PIL import Image
-        img = Image.open(io.BytesIO(resp.content))
-        img = img.convert("RGB")  # приводим WebP/PNG-с-альфаканалом/CMYK и т.п. к обычному RGB
-
-        os.makedirs(MEDIA_DIR, exist_ok=True)
-        filename = hashlib.md5(url.encode()).hexdigest()[:16] + ".jpg"
-        path = os.path.join(MEDIA_DIR, filename)
-        img.save(path, "JPEG", quality=85)
+        with open(path, "wb") as file:
+            file.write(response.content)
         return path
-    except Exception as e:
-        logger.warning(f"Не удалось скачать/обработать фото {url}: {e}")
-        return None
-
-
-def get_image_for_entry(entry, article_url: str, search_query: str, broader_query: str = "", person_name: str = "") -> str:
-    """
-    По умолчанию НЕ берёт фото со страницы источника (og:image) и не
-    берёт миниатюру из RSS — у крупных изданий эти фото почти всегда
-    содержат их логотип/вотермарку. Вместо этого ищет нейтральное фото
-    по теме в интернете, с приоритетом на точный портрет конкретного
-    футболиста (см. search_fallback_image). Найденную ссылку скачивает и
-    проверяет локально (download_and_prepare_image) — если это не
-    получилось, использует гарантированный локальный плейсхолдер. Если
-    понадобится вернуть старое поведение — см. config.USE_SOURCE_IMAGES.
-    """
-    if USE_SOURCE_IMAGES:
-        image = extract_image_from_article(article_url)
-        if image:
-            local = download_and_prepare_image(image)
-            if local:
-                return local
-        image = extract_image_from_rss_entry(entry)
-        if image:
-            local = download_and_prepare_image(image)
-            if local:
-                return local
-
-    candidate_url = search_image_with_broadening(search_query, broader_query or search_query, person_name=person_name)
-
-    if candidate_url == PLACEHOLDER_IMAGE:
-        return LOCAL_PLACEHOLDER_PATH
-
-    local_path = download_and_prepare_image(candidate_url)
-    return local_path or LOCAL_PLACEHOLDER_PATH
-
-
-# Фразы-маркеры "мусорных" абзацев — реклама, подписки, навигация,
-# related-статьи и т.п., которые попадаются даже внутри <article>
-_BOILERPLATE_MARKERS = [
-    "sign up", "subscribe", "newsletter", "follow us", "related:",
-    "read more:", "share this", "advertisement", "sponsored",
-    "all rights reserved", "cookie", "click here", "watch:",
-    "подпишись", "подписывайся", "реклама", "читайте также",
-    "подробнее:",
-]
-
-
-def _is_boilerplate_paragraph(text: str) -> bool:
-    """True для абзацев-мусора: реклама, подписки, навигация и т.п."""
-    lowered = text.lower()
-    return any(marker in lowered for marker in _BOILERPLATE_MARKERS)
-
-
-def _extract_with_readability(html: str) -> list[str] | None:
-    """
-    Пытается вычленить основной текст статьи через readability-lxml —
-    библиотеку, которая (в отличие от простого перебора всех <p>) умеет
-    отличать основной контент от меню/сайдбара/рекламы примерно так же,
-    как это делает "режим чтения" в браузере. Возвращает список абзацев
-    или None, если библиотека недоступна или не смогла ничего вычленить.
-    """
-    try:
-        from readability import Document
-    except ImportError:
-        return None
-
-    try:
-        doc = Document(html)
-        summary_html = doc.summary()
-    except Exception as e:
-        logger.warning(f"readability не смогла разобрать статью: {e}")
-        return None
-
-    soup = BeautifulSoup(summary_html, "html.parser")
-    paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
-    paragraphs = [p for p in paragraphs if len(p) > 40 and not _is_boilerplate_paragraph(p)]
-    return paragraphs or None
-
-
-def _extract_with_fallback(html: str) -> list[str]:
-    """
-    Запасной вариант, если readability-lxml не установлена или не
-    справилась: ищем <article>, иначе всю страницу, берём все <p>,
-    отфильтровываем короткие/мусорные абзацы.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    container = soup.find("article") or soup
-
-    paragraphs = [p.get_text(" ", strip=True) for p in container.find_all("p")]
-    return [p for p in paragraphs if len(p) > 40 and not _is_boilerplate_paragraph(p)]
-
-
-def extract_article_text(article_url: str) -> str:
-    """
-    Заходит на страницу статьи и собирает основной текст, сохраняя
-    разбивку на абзацы (соединены \\n\\n, а не в одну сплошную строку).
-    Приоритет — readability-lxml (умное вычленение основного контента,
-    отличает статью от меню/рекламы/сайдбара); если недоступна или не
-    справилась — запасной способ (все <p> внутри <article>, с фильтром
-    явного мусора).
-
-    Больше НЕ обрезает текст по длине — полный текст сохраняется и
-    переводится целиком; финальная обрезка под лимит поста происходит
-    отдельно, непосредственно перед отправкой (см. bot.py:truncate_caption
-    и config.ARTICLE_MAX_CHARS, применяемый уже к переведённому тексту).
-    Если вместо статьи загрузилась страница с ошибкой сервера —
-    возвращает пустую строку, чтобы взять запасной текст из RSS summary.
-    """
-    try:
-        resp = requests.get(article_url, headers=HEADERS, timeout=10)
-        resp.raise_for_status()
     except requests.RequestException as e:
-        logger.warning(f"Не удалось загрузить текст статьи {article_url}: {e}")
-        return ""
+        logger.warning(f"Не удалось скачать фото {label}: {e}")
+        return None
 
-    paragraphs = _extract_with_readability(resp.text)
-    if not paragraphs:
-        paragraphs = _extract_with_fallback(resp.text)
-
-    text = "\n\n".join(paragraphs)
-
-    if _looks_like_error_page(text):
-        logger.warning(f"Похоже на страницу с ошибкой вместо статьи ({article_url}), беру RSS summary")
-        return ""
-
-    return text
-
-
-def _translate_single(text: str, translator) -> str:
-    """Переводит один кусок текста (< 4500 симв. — лимит Google Translate за раз), с разбивкой по предложениям при необходимости."""
-    if len(text) <= 4500:
-        return translator.translate(text)
-    chunks = re.split(r"(?<=[.!?])\s+", text)
-    translated_chunks = [translator.translate(chunk) for chunk in chunks if chunk.strip()]
-    return " ".join(translated_chunks)
-
-
-def translate_text(text: str) -> str:
-    """
-    Переводит текст на язык из config.TRANSLATE_TO, сохраняя разбивку на
-    абзацы (текст с \\n\\n переводится по абзацам, а не одним сплошным
-    куском — так итоговое форматирование не "слипается"). Если перевод
-    не удался — возвращает оригинал.
-    """
+def translate_text(text):
     if not text or not TRANSLATE_TO:
         return text
     try:
         translator = GoogleTranslator(source="auto", target=TRANSLATE_TO)
-        if "\n\n" not in text:
-            return _translate_single(text, translator)
+        if len(text) <= 4500:
+            return translator.translate(text)
 
-        paragraphs = text.split("\n\n")
-        translated_paragraphs = [_translate_single(p, translator) for p in paragraphs if p.strip()]
-        return "\n\n".join(translated_paragraphs)
+        parts = re.split(r"(?<=[.!?])\s+", text)
+        chunks, current = [], ""
+        for part in parts:
+            if not part:
+                continue
+            if len(current) + len(part) + 1 <= 4500:
+                current += (" " if current else "") + part
+            else:
+                if current:
+                    chunks.append(translator.translate(current))
+                current = part
+        if current:
+            chunks.append(translator.translate(current))
+        return " ".join(chunks)
     except Exception as e:
         logger.warning(f"Не удалось перевести текст: {e}")
         return text
 
-
-def pick_headline_icon(title: str) -> str:
-    """Подбирает иконку под заголовок: цитаты — 🗣, трансферы — 👀, обычные новости — 📰."""
-    lowered = title.lower()
-    quote_markers = [" says", " on ", ":", "'", "\u2018", "\u2019"]
-    transfer_markers = ["transfer", "sign", "deal", "move to", "join"]
-
-    if any(m in lowered for m in quote_markers):
-        return "🗣"
-    if any(m in lowered for m in transfer_markers):
-        return "👀"
-    return "📰"
-
-
-def _known_club_names() -> list[str]:
-    """Список названий клубов — берётся из твоих же источников в config.FEEDS."""
+def _club_names():
     names = []
     for label, _ in FEEDS:
-        club = label.split("—")[0].strip()
-        if club and "целом" not in club.lower():
-            names.append(club)
+        if "—" in label:
+            name = label.split("—")[0].strip()
+            if name and "целом" not in name.lower():
+                names.append(name)
     return names
 
+CLUB_NAMES = _club_names()
 
-CLUB_NAMES = _known_club_names()
-
-_NAME_STOPWORDS = {
-    "The", "This", "That", "After", "Before", "During", "According",
-    "However", "Meanwhile", "Following", "Despite", "Manchester",
-}
-
-
-def find_club_mention(text: str) -> str | None:
-    """Ищет упоминание клуба (из CLUB_NAMES) в тексте."""
+def find_club_mention(text):
     lowered = text.lower()
     for club in CLUB_NAMES:
         if club.lower() in lowered:
             return club
     return None
 
-
-def find_player_name(text: str) -> str | None:
-    """
-    Простая эвристика для имени футболиста: два подряд идущих слова с
-    заглавной буквы — исключая уже известные названия клубов и служебные
-    слова.
-    """
-    candidates = re.findall(r"\b[A-Z][a-zA-Z'\-]+ [A-Z][a-zA-Z'\-]+\b", text)
+def find_player_name(text):
+    candidates = re.findall(r"\b[A-Z][a-zA-Z'-]+ [A-Z][a-zA-Z'-]+\b", text)
+    stop = {
+        "The", "This", "That", "After", "Before", "During", "According",
+        "However", "Meanwhile", "Following", "Despite",
+    }
     for candidate in candidates:
-        first_word = candidate.split()[0]
-        if first_word in _NAME_STOPWORDS:
-            continue
-        if any(candidate.lower() in club.lower() or club.lower() in candidate.lower() for club in CLUB_NAMES):
+        if candidate.split()[0] in stop:
             continue
         return candidate
     return None
 
+def build_entry_content(entry, article_url, title):
+    title_en = (entry.get("title") or title or "").strip()
+    rss_summary = clean_html(entry.get("summary", ""))
 
-def pick_image_search_query(title_en: str, body_en: str, fallback: str) -> tuple[str, str, str]:
-    """
-    Разбирает текст новости и определяет, каких футболистов/клубы она
-    касается. Возвращает (точный_запрос, запасной_запрос, имя_игрока):
-    - точный: "игрок клуб" > игрок > клуб > исходный заголовок
-    - запасной: клуб (если есть) > "football"
-    - имя_игрока: отдельно, для точного поиска портрета через Wikipedia
-    """
-    combined = f"{title_en} {body_en[:300]}"
+    article_text = extract_article_text(article_url) if article_url else ""
+    # Real article text wins. RSS is fallback only.
+    body_en = article_text if len(article_text) >= 120 else rss_summary
 
-    player = find_player_name(title_en) or find_player_name(combined)
-    club = find_club_mention(combined)
+    player = find_player_name(f"{title_en} {body_en[:700]}")
+    club = find_club_mention(f"{title_en} {body_en[:700]}")
+    search_query = " ".join(x for x in (player, club) if x) or title_en
+    broad_query = club or "football"
 
-    broader = club or "football"
+    # Image priority:
+    # source article -> RSS -> Wikipedia/Wikimedia/Unsplash -> placeholder.
+    image_candidates = []
+    if USE_SOURCE_IMAGES:
+        source_image = extract_image_from_article(article_url)
+        if source_image:
+            image_candidates.append(source_image)
 
-    if player and club:
-        return f"{player} {club}", broader, player
-    if player:
-        return player, broader, player
-    if club:
-        return club, broader, ""
-    return fallback, "football", ""
+        rss_image = extract_image_from_rss_entry(entry)
+        if rss_image:
+            image_candidates.append(rss_image)
 
+    image_candidates.append(search_fallback_image(search_query, player))
 
-def _truncate_paragraphs(text: str, max_chars: int) -> str:
-    """
-    Обрезает текст под лимит длины, стараясь резать по границе абзаца, а
-    не посреди слова/предложения — так итоговый пост выглядит аккуратнее.
-    Если даже первый абзац длиннее лимита — обрезает его по словам.
-    """
-    if len(text) <= max_chars:
-        return text
-
-    paragraphs = text.split("\n\n")
-    result = []
-    used = 0
-    for p in paragraphs:
-        # +2 за "\n\n", которые добавятся при склейке
-        if used + len(p) + 2 > max_chars:
+    image_url = PLACEHOLDER_IMAGE
+    for candidate in image_candidates:
+        if not candidate:
+            continue
+        if DOWNLOAD_IMAGES_LOCALLY:
+            local = _download_image(candidate, search_query)
+            if local:
+                image_url = local
+                break
+        elif _valid_image_url(candidate):
+            image_url = candidate
             break
-        result.append(p)
-        used += len(p) + 2
 
-    if result:
-        return "\n\n".join(result) + "…"
-
-    # даже один абзац не влезает целиком — обрезаем по словам
-    return text[:max_chars].rsplit(" ", 1)[0] + "…"
-
-
-def build_entry_content(entry, article_url: str, title: str):
-    """
-    Читает и анализирует пост -> определяет игроков/клубы -> ищет фото
-    именно по ним (приоритет — точный портрет игрока через Wikipedia) ->
-    переводит текст для самого поста -> обрезает под лимит длины поста
-    уже ПОСЛЕ перевода (config.ARTICLE_MAX_CHARS), чтобы не терять
-    информацию на середине обработки.
-
-    Возвращает (None, None), если сама RSS-запись выглядит как сбой
-    сайта-источника — вызывающий код должен пропустить такую запись.
-    """
-    title_en = entry.get("title", "").strip()
-
-    if _looks_like_error_page(title_en):
-        logger.warning(f"Заголовок похож на страницу с ошибкой сайта-источника, пропускаю запись: {title_en!r}")
-        return None, None
-
-    rss_summary_en = clean_html(entry.get("summary", ""))
-
-    full_text_en = extract_article_text(article_url) if article_url else ""
-    body_en = full_text_en if len(full_text_en) > len(rss_summary_en) else rss_summary_en
-
-    search_query, broader_query, person_name = pick_image_search_query(title_en, body_en, fallback=title_en)
-    image_url = get_image_for_entry(entry, article_url, search_query, broader_query, person_name)
-
-    icon = pick_headline_icon(title_en)
     title_ru = translate_text(title_en)
     body_ru = translate_text(body_en)
-    body_ru = _truncate_paragraphs(body_ru, ARTICLE_MAX_CHARS)
+    body_ru = re.sub(r"\n{3,}", "\n\n", body_ru).strip()
 
-    if not body_ru:
-        text = f"{icon} {title_ru}"
-    elif icon == "🗣":
-        # цитатный пост — оформляем как прямую речь, в кавычках-ёлочках
-        text = f"{icon} {title_ru}\n\n«{body_ru}»"
-    else:
-        # обычная новость — нормальными абзацами, без кавычек вокруг всего текста
-        text = f"{icon} {title_ru}\n\n{body_ru}"
+    text = f"📰 {title_ru}"
+    if body_ru:
+        text += f"\n\n{body_ru}"
 
-    return text, image_url
+    return text.strip(), image_url
